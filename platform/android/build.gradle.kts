@@ -31,6 +31,10 @@ android {
         ndk { abiFilters += "arm64-v8a" }
     }
 
+    signingConfigs.getByName("debug") {
+        storeFile = file(System.getProperty("user.home") + "/.android/debug.keystore")
+    }
+
     buildTypes {
         release {
             // For development devices, as the iOS app: the debug key.
