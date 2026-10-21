@@ -3,12 +3,14 @@ package local.glue5;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
+import android.net.Uri;
 import android.os.Bundle;
 import android.view.Gravity;
 import android.view.WindowManager;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
+import android.widget.Button;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -23,12 +25,15 @@ public class ShaderInstallActivity extends Activity {
     private static final int FILE_COUNT = 6615;
     private TextView status;
     private ProgressBar progress;
+    private LinearLayout layout;
+    private boolean busy = true;
+    private static final int PICK_DATA = 1;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        LinearLayout layout = new LinearLayout(this);
+        layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
         layout.setGravity(Gravity.CENTER);
         layout.setPadding(48, 48, 48, 48);
@@ -45,10 +50,7 @@ public class ShaderInstallActivity extends Activity {
                 installShaders();
                 runOnUiThread(() -> {
                     if (isFinishing() || isDestroyed()) return;
-                    Intent game = new Intent(this, Glue5Activity.class);
-                    if (getIntent().getExtras() != null) game.putExtras(getIntent().getExtras());
-                    startActivity(game);
-                    finish();
+                    showMenu("Шейдеры готовы. Можно импортировать ZIP с папкой data или запустить игру.");
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> {
@@ -63,6 +65,79 @@ public class ShaderInstallActivity extends Activity {
                 });
             }
         }, "shader-installer").start();
+    }
+
+    private void showMenu(String message) {
+        busy = false;
+        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        layout.removeAllViews();
+        status.setText(message);
+        layout.addView(status);
+        Button importButton = new Button(this);
+        importButton.setText("Импортировать data из ZIP");
+        importButton.setOnClickListener(view -> {
+            Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            picker.addCategory(Intent.CATEGORY_OPENABLE);
+            picker.setType("*/*");
+            picker.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivityForResult(picker, PICK_DATA);
+        });
+        layout.addView(importButton);
+        Button play = new Button(this);
+        play.setText("Запустить Glue5");
+        play.setOnClickListener(view -> {
+            Intent game = new Intent(this, Glue5Activity.class);
+            if (getIntent().getExtras() != null) game.putExtras(getIntent().getExtras());
+            startActivity(game);
+            finish();
+        });
+        layout.addView(play);
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent result) {
+        super.onActivityResult(requestCode, resultCode, result);
+        if (requestCode != PICK_DATA || resultCode != RESULT_OK || result == null || busy) return;
+        Uri uri = result.getData();
+        if (uri == null) return;
+        busy = true;
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        layout.removeAllViews();
+        status.setText("Импорт ZIP… Оставьте приложение открытым до завершения.");
+        layout.addView(status);
+        progress.setIndeterminate(true);
+        layout.addView(progress, new LinearLayout.LayoutParams(-1, -2));
+        new Thread(() -> {
+            try {
+                File external = getExternalFilesDir(null);
+                if (external == null) throw new IOException("Хранилище недоступно");
+                int count;
+                try (java.io.InputStream input = getContentResolver().openInputStream(uri)) {
+                    if (input == null) throw new IOException("Не удалось открыть ZIP");
+                    count = DataArchive.extract(input, new File(external, "game"),
+                            (files, bytes, name) -> runOnUiThread(() -> status.setText(
+                                    "Импорт: " + files + " файлов, " + (bytes / 1048576) + " МБ\n"
+                                    + name + "\nНе закрывайте приложение.")));
+                }
+                runOnUiThread(() -> {
+                    if (!isFinishing() && !isDestroyed()) showMenu(
+                            "Импорт завершён: " + count + " файлов. CRC файлов ZIP проверены.\n"
+                            + "Архив в Download теперь можно удалить.");
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    if (!isFinishing() && !isDestroyed()) showMenu(
+                            "Импорт не завершён: " + e.getMessage() + "\n"
+                            + "Проверьте архив и свободное место, затем выберите ZIP повторно. "
+                            + "Уже распакованные файлы сохранены; повторный импорт заменит их.");
+                });
+            }
+        }, "data-importer").start();
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (!busy) super.onBackPressed();
     }
 
     private void installShaders() throws IOException {
