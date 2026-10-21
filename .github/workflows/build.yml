@@ -83,6 +83,15 @@ jobs:
           cp debug.keystore Glue5-android.keystore
           "$GITHUB_WORKSPACE/.github/scripts/draft.sh" upload "${{ steps.game.outputs.release }}" Glue5-android.keystore
 
+      - name: Bundled Android shaders
+        if: inputs.platform == 'android'
+        run: |
+          mkdir -p target/android/assets
+          cd target/android/assets
+          "$GITHUB_WORKSPACE/.github/scripts/draft.sh" get "${{ steps.game.outputs.release }}" Glue5-shaders.zip
+          echo "9df9a83a283b55b8f61d4b37ddce3a2929fa7c90af9a8d6e46544699142c146c  Glue5-shaders.zip" | sha256sum -c -
+          mv Glue5-shaders.zip shaders.zip
+
       - name: Build
         run: |
           case $PLATFORM in

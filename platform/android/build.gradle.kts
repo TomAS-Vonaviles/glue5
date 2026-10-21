@@ -26,8 +26,8 @@ android {
         applicationId = "local.glue5"
         minSdk = setting("minSdk").toInt()
         targetSdk = setting("compileSdk").toInt()
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1-shaders"
         ndk { abiFilters += "arm64-v8a" }
     }
 
@@ -47,6 +47,7 @@ android {
         java.srcDirs("java", setting("sdlJava"))
         res.srcDirs("res", generated.resolve("res"))
         jniLibs.srcDirs(generated.resolve("jniLibs"))
+        assets.srcDirs(generated.resolve("assets"))
     }
 
     lint {
