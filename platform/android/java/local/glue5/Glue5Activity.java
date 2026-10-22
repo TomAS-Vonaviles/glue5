@@ -26,6 +26,17 @@ public class Glue5Activity extends SDLActivity {
                 }
             }
         }
+        // Apply before SDL starts the native renderer. Absence, not "0",
+        // enables ETC2 again: the renderer checks whether the variable exists.
+        boolean noEtc2 = getSharedPreferences("graphics-workarounds", MODE_PRIVATE)
+                .getBoolean("no-etc2", true);
+        try {
+            if (noEtc2) Os.setenv("GLUE5_NO_ETC2", "1", true);
+            else Os.unsetenv("GLUE5_NO_ETC2");
+            android.util.Log.i("Glue5", "Texture workaround: GLUE5_NO_ETC2=" + noEtc2);
+        } catch (ErrnoException e) {
+            android.util.Log.e("Glue5", "Cannot apply ETC2 setting", e);
+        }
         super.onCreate(savedInstanceState);
     }
 

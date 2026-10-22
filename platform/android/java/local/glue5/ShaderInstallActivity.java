@@ -11,6 +11,7 @@ import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Button;
+import android.widget.CheckBox;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -83,6 +84,17 @@ public class ShaderInstallActivity extends Activity {
             startActivityForResult(picker, PICK_DATA);
         });
         layout.addView(importButton);
+        CheckBox noEtc2 = new CheckBox(this);
+        noEtc2.setText("Без сжатия ETC2 (RGBA8, больше расход памяти)");
+        noEtc2.setChecked(getSharedPreferences("graphics-workarounds", MODE_PRIVATE)
+                .getBoolean("no-etc2", true));
+        noEtc2.setOnCheckedChangeListener((button, checked) ->
+                getSharedPreferences("graphics-workarounds", MODE_PRIVATE).edit()
+                        .putBoolean("no-etc2", checked).apply());
+        layout.addView(noEtc2);
+        TextView restartHint = new TextView(this);
+        restartHint.setText("После смены режима полностью остановите приложение в настройках Android и откройте снова.");
+        layout.addView(restartHint);
         Button play = new Button(this);
         play.setText("Запустить Glue5");
         play.setOnClickListener(view -> {

@@ -26,8 +26,8 @@ android {
         applicationId = "local.glue5"
         minSdk = setting("minSdk").toInt()
         targetSdk = setting("compileSdk").toInt()
-        versionCode = 3
-        versionName = "0.1.2-data-import"
+        versionCode = 4
+        versionName = "0.1.3-no-etc2"
         ndk { abiFilters += "arm64-v8a" }
     }
 
