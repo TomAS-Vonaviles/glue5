@@ -53,9 +53,26 @@ pub fn panic_recoverable() {
     RECOVERABLE.set(true);
 }
 
+/// Runs `f` with this thread's panics marked as ones the game does without
+/// (its caller catches them), as it was afterwards.
+pub fn recoverable<R>(f: impl FnOnce() -> R) -> R {
+    let before = RECOVERABLE.replace(true);
+    let out = f();
+    RECOVERABLE.set(before);
+    out
+}
+
 /// Whether this thread's panic leaves the game running ([`panic_recoverable`]).
 pub fn is_panic_recoverable() -> bool {
     RECOVERABLE.get()
+}
+
+/// Ends the process with `code`: every way out goes here, so that what
+/// must stop before the system's libraries go does (Android's performance
+/// hints, see [`crate::qos::end`]).
+pub fn process(code: i32) -> ! {
+    crate::qos::end();
+    std::process::exit(code)
 }
 
 /// Records why the game has stopped (the first reason: what follows may be

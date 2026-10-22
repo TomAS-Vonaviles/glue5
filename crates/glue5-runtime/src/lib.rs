@@ -8,6 +8,7 @@
 pub mod audio;
 mod audio_update;
 mod blips;
+mod clib;
 mod boot_screen;
 mod cloud;
 pub mod cpu;
@@ -16,6 +17,7 @@ mod draw_lists;
 mod dht;
 pub mod exit;
 mod files;
+pub mod frame_pace;
 pub mod friends;
 pub mod game_settings;
 mod gamer_tags;
@@ -30,13 +32,15 @@ mod online;
 pub mod overlay;
 mod p2p;
 pub mod prompts;
-pub mod qos;
+/// Thread priorities (a crate of their own: the stream's threads have them too).
+pub use glue5_qos as qos;
 mod readback;
 mod scenario;
 mod shader_settings;
 mod shadow_reveal;
 mod script_assets;
 mod skin;
+pub mod sprites;
 mod stats;
 mod stream;
 mod texts;
@@ -47,6 +51,7 @@ mod trap_site;
 mod upscale;
 pub mod vfs;
 mod vnet;
+mod waits;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -63,6 +68,33 @@ pub use glue5_game::GAME_BUILD;
 pub fn cores() -> usize {
     static CORES: OnceLock<usize> = OnceLock::new();
     *CORES.get_or_init(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
+}
+
+/// A mutex's value, also after a panic while it was held: what the
+/// network threads and the engine's hooks share stays usable, so a host
+/// thread's failure ends with the application's message rather than an
+/// abort in the next hook that takes the lock.
+pub(crate) trait Locked<T> {
+    fn locked(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> Locked<T> for std::sync::Mutex<T> {
+    fn locked(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Writes `path` whole, through a copy beside it renamed over it: a write
+/// cut short (a full disk, the app killed) leaves the file as it was, not
+/// one cut short (a character, its stats, a job: the only copies there are).
+pub(crate) fn write_file(path: &std::path::Path, data: impl AsRef<[u8]>) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// The game directory's layout, as the whale5 server serves it: the engine's
@@ -117,7 +149,8 @@ pub struct Config {
     /// game; the engine writes the results in the user directory
     /// (`Documents/Rockstar Games/GTA V/Benchmarks`) and asks to quit.
     pub benchmark: bool,
-    /// GTA Online in a lobby, instead of story mode or the sandbox.
+    /// GTA Online: straight into it, or from the story's pause menu (the
+    /// network up all the same). `None`: the sandbox, the benchmark.
     pub online: Option<Online>,
     /// The game's language, as a tag like `it-IT` (the engine matches the
     /// whole tag, then the language alone). `None`: `$LANG`, else English.
@@ -129,10 +162,15 @@ pub struct Config {
 pub struct Online {
     /// The player's name, as the others see it (16 characters at most).
     pub name: String,
-    /// The lobby to start in: empty, everyone's, where the game's
-    /// matchmaking puts the player in a session; a friend's, to join it
-    /// there. The session's kind moves the player on (`online.rs`).
+    /// The lobby to start in (or to go to from the story): empty,
+    /// everyone's, where the game's matchmaking puts the player in a
+    /// session; a friend's, to join it there. The session's kind moves the
+    /// player on (`online.rs`).
     pub lobby: String,
+    /// Straight into freemode (the start page's GTA Online); otherwise the
+    /// story, with GTA Online a choice of its pause menu, a friend's join
+    /// or invite away.
+    pub freemode: bool,
 }
 
 impl Config {
@@ -188,9 +226,12 @@ impl Config {
             args.push("-FrameQueueLimit=2".into());
         }
         args.extend(extra);
-        if self.online.is_some() {
+        if let Some(online) = &self.online {
             args.retain(|a| a != "-nonetwork");
             args.extend(online::ENGINE_ARGS.iter().map(|a| a.to_string()));
+            if online.freemode {
+                args.push("-StraightIntoFreemode".into());
+            }
         }
         args
     }
@@ -298,6 +339,9 @@ pub fn start(config: Config, gpu: gpu::GpuBackend) -> Result<Game> {
     device_reset::hooks(&mut hooks);
     readback::hooks(&mut hooks);
     audio_update::hooks(&mut hooks);
+    frame_pace::hooks(&mut hooks);
+    clib::hooks(&mut hooks);
+    waits::hooks(&mut hooks);
     granular::hooks(&mut hooks);
     script_assets::hooks(&mut hooks);
     gamer_tags::hooks(&mut hooks);
@@ -311,10 +355,10 @@ pub fn start(config: Config, gpu: gpu::GpuBackend) -> Result<Game> {
     for set in EXTRA_HOOKS.lock().unwrap().iter() {
         set(&mut hooks);
     }
+    friends::set_playing(friends::Playing::Story);
     if let Some(online) = &rt().config.online {
         online::start(online, &mut hooks);
     }
-    friends::set_playing(if rt().config.online.is_some() { friends::Playing::Online } else { friends::Playing::Story });
     glue5_game::install(glue5_game::imports_from!(imports), hooks);
     let engine = threads::spawn_main()?;
     Ok(Game { engine })

@@ -27,7 +27,7 @@ use crate::paths::{self, MOBILE, TOUCH, TV};
 use crate::settings::{self, PerfOverlay, Settings, Source, TouchMode, Upscaling};
 use crate::touch::{self, Touch};
 use crate::ui::{self, Action, Mode, Page, Started, Status, Ui};
-use crate::{audio, benchmark, keymap, pads};
+use crate::{audio, benchmark, drivers, keymap, pads};
 
 /// The settings button's opacity over the game while the touch controls
 /// are hidden (a controller in use, or touch off): there, but faint.
@@ -36,6 +36,9 @@ const GEAR_ALONE: f32 = 0.35;
 /// In the user directory: why the last game stopped, for the start page
 /// (gone once the game is started again).
 const FAILURE_FILE: &str = "last-failure.txt";
+
+/// How often the pages read the controllers, when the loop reads them.
+const PAD_READ: Duration = Duration::from_millis(16);
 /// How long the pointer waits to be captured once it should be (`App::pointer`).
 const CAPTURE_DELAY: Duration = Duration::from_millis(150);
 
@@ -89,15 +92,20 @@ pub fn run() -> Result<()> {
         builder.metal_view();
     }
     let window = builder.build()?;
+    crate::keyboard::init(&window);
     let pixels = window.size_in_pixels();
     settings.for_screen(pixels.1);
 
     let presentation = Presentation::new(pixels, settings.vsync, upscaler(&settings));
     presentation.set_metal_hud(settings.overlay == PerfOverlay::MetalHud);
     let overlay = glue5_gpu::Overlay::default();
-    let instance = glue5_gpu::instance();
+    // On the GPU driver the user chose (Android), if it opens.
     #[cfg(target_os = "android")]
-    let surfaces = instance.clone();
+    let (instance, mut driver_note) = drivers::instance(&user_dir, &mut settings.gpu_driver);
+    #[cfg(not(target_os = "android"))]
+    let (instance, driver_note) = (glue5_gpu::instance(), None::<String>);
+    #[cfg(target_os = "android")]
+    let mut surfaces = instance.clone();
     // The window outlives the renderer: the process exits with it.
     #[cfg(not(target_os = "tvos"))]
     let surface = unsafe {
@@ -118,7 +126,24 @@ pub fn run() -> Result<()> {
         surface,
         presentation: presentation.clone(),
         overlay: overlay.clone(),
-    })?;
+    });
+    // A driver the user added that loads but cannot open its GPU: the
+    // phone's, now.
+    #[cfg(target_os = "android")]
+    let screen = match screen {
+        Err(e) if settings.gpu_driver.is_some() => {
+            driver_note = Some(drivers::device_failed(&user_dir, &mut settings.gpu_driver, &e));
+            let instance = glue5_gpu::instance();
+            surfaces = instance.clone();
+            let surface = unsafe {
+                instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::from_display_and_window(&window, &window)?)?
+            };
+            Screen::open(glue5_gpu::Window { instance, surface, presentation: presentation.clone(), overlay: overlay.clone() })
+        }
+        screen => screen,
+    };
+    let screen = screen?;
+    let drivers = gpu_drivers(&user_dir, &settings, &screen.adapter_info(), driver_note);
     // While the system resizes the window in a loop of its own (macOS,
     // Windows), events wait for it to end, and so does this loop; SDL still
     // calls watches, and from there the renderer follows the window. The
@@ -132,10 +157,35 @@ pub fn run() -> Result<()> {
         Event::Window { win_event: WindowEvent::PixelSizeChanged(w, h), .. } => {
             watched.set_size(w.max(0) as u32, h.max(0) as u32)
         }
+        // iOS sends it also while the app is only inactive (Control Center,
+        // a system alert): suspended is when it did go to the background.
         Event::AppWillEnterBackground { .. } => life.background.store(true, Ordering::Relaxed),
+        // The game stops at the end of its frame: Android lets it run on
+        // unseen, and iOS, until it suspends the app, fails its frames'
+        // GPU work (not while only inactive: the game shows there).
+        // A phone may end an app in the background without a word: what
+        // it should keep is saved as it goes there, from here (Android's
+        // SDL then waits in the loop's wait for events until the app comes
+        // back: the loop does not run again before).
+        Event::AppDidEnterBackground { .. } => {
+            life.suspended.store(true, Ordering::Relaxed);
+            glue5_runtime::frame_pace::set_background(true);
+            glue5_gpu::set_background(true);
+            life.save();
+        }
+        // The system is short of memory: iOS's memory warning, Android's
+        // onTrimMemory. SDL passes on every level of the latter, the app's
+        // window hidden included, so it comes at each trip to the
+        // background: that is wanted, as Android ends background apps by
+        // their memory, and from Android 14 the levels for an app still
+        // running are no longer sent. A trim is cheap (what it frees is made
+        // again as frames need it).
+        Event::AppLowMemory { .. } => glue5_gpu::trim(),
         Event::AppDidEnterForeground { .. } => {
             life.background.store(false, Ordering::Relaxed);
             life.came_back.store(true, Ordering::Relaxed);
+            glue5_runtime::frame_pace::set_background(false);
+            glue5_gpu::set_background(false);
         }
         _ => {}
     });
@@ -155,6 +205,10 @@ pub fn run() -> Result<()> {
         events: sdl.event_pump().map_err(|e| anyhow!("SDL events: {e}"))?,
         sdl,
         window,
+        #[cfg(target_os = "android")]
+        asked_rate: None,
+        #[cfg(target_os = "ios")]
+        thermal: (-1, None),
         text_input,
         typing: None,
         typing_rect: None,
@@ -171,6 +225,10 @@ pub fn run() -> Result<()> {
         touch_mouse: Default::default(),
         lifecycle,
         folder: None,
+        driver_mark: drivers.as_ref().is_some_and(|d| d.in_use.is_some()),
+        drivers,
+        driver_pick: None,
+        driver_adding: None,
         game_dir: None,
         problem: None,
         stream: None,
@@ -178,6 +236,7 @@ pub fn run() -> Result<()> {
         stream_for: None,
         sharing: None,
         studio: None,
+        studio_failed: None,
         servers: Arc::default(),
         stream_waiting: None,
         last_failure: None,
@@ -197,6 +256,10 @@ pub fn run() -> Result<()> {
         game: None,
     };
     app.last_failure = std::fs::read_to_string(app.user_dir.join(FAILURE_FILE)).ok();
+    if app.drivers.as_ref().is_some_and(|d| d.fallback.is_some()) {
+        // The setting went back to the phone's driver.
+        app.settings.save(&app.user_dir);
+    }
     app.find_game(args.game_dir.as_deref());
     if args.play {
         match app.settings.source {
@@ -243,6 +306,37 @@ struct Lifecycle {
     background: AtomicBool,
     /// Back in the foreground since the loop last looked.
     came_back: AtomicBool,
+    /// Was in the background for real (not only inactive) before that.
+    suspended: AtomicBool,
+    /// What a trip to the background saves, as the loop last left it.
+    to_save: Mutex<ToSave>,
+}
+
+#[derive(Default)]
+struct ToSave {
+    /// The settings, and the user directory they go in.
+    settings: Option<(Settings, PathBuf)>,
+    /// (Not kept alive from here: a stopped stream's copy closes once its
+    /// client has finished.)
+    stream: std::sync::Weak<glue5_stream::Client>,
+}
+
+impl Lifecycle {
+    /// Saves what the app keeps: the settings, the stream's index, the
+    /// friends (as [`App::save`] does).
+    fn save(&self) {
+        let (settings, stream) = {
+            let to = self.to_save.lock().unwrap();
+            (to.settings.clone(), to.stream.upgrade())
+        };
+        if let Some((settings, dir)) = settings {
+            settings.save(&dir);
+        }
+        if let Some(stream) = stream {
+            stream.flush();
+        }
+        glue5_runtime::friends::flush();
+    }
 }
 
 /// What is being typed into: a field of the app's, or the game's text box.
@@ -264,6 +358,10 @@ impl Typing {
             Typing::App(ui::TextKind::Code) => (TextInputType::Text, Capitalization::Letters, false),
             Typing::App(ui::TextKind::Address) => (TextInputType::Text, Capitalization::None, false),
             Typing::App(ui::TextKind::Name) => (TextInputType::Text, Capitalization::Words, false),
+            Typing::App(ui::TextKind::Number) if cfg!(not(target_os = "ios")) => {
+                (TextInputType::Number, Capitalization::None, false)
+            }
+            Typing::App(ui::TextKind::Number) => (TextInputType::Text, Capitalization::None, false),
             Typing::Game(TextType::Email) => (TextInputType::Email, Capitalization::None, false),
             Typing::Game(TextType::Password) => (TextInputType::PasswordHidden, Capitalization::None, false),
             Typing::Game(TextType::Numeric) if cfg!(not(target_os = "ios")) => {
@@ -286,6 +384,13 @@ impl Typing {
 struct App {
     sdl: sdl3::Sdl,
     window: sdl3::video::Window,
+    /// The display rate asked of Android for the window's surface.
+    #[cfg(target_os = "android")]
+    asked_rate: Option<u32>,
+    /// The device's thermal state (iOS: 0 nominal to 3 critical) and when it
+    /// was last asked.
+    #[cfg(target_os = "ios")]
+    thermal: (isize, Option<Instant>),
     events: sdl3::EventPump,
     mouse: sdl3::mouse::MouseUtil,
     text_input: sdl3::keyboard::TextInputUtil,
@@ -314,7 +419,14 @@ struct App {
     /// menu's).
     touch_mouse: touch::Mouse,
     lifecycle: Arc<Lifecycle>,
-    folder: Option<FolderPick>,
+    folder: Option<Pick>,
+    /// The GPU drivers the user can add, where the settings show them.
+    drivers: Option<drivers::Drivers>,
+    /// The launch's driver mark is still there (see drivers.rs).
+    driver_mark: bool,
+    /// The file picker for a driver package, then its unpacking.
+    driver_pick: Option<Pick>,
+    driver_adding: Option<std::thread::JoinHandle<Result<drivers::Package, String>>>,
     /// The game's folder, once found.
     game_dir: Option<PathBuf>,
     /// Why it was not, or a folder chosen that is not one.
@@ -332,6 +444,9 @@ struct App {
     /// GLUE 5 Studio, served while the game runs with mods and the setting
     /// is on, and what the mods page shows of it.
     studio: Option<(glue5_mods::studio::Studio, ui::StudioInfo)>,
+    /// The Studio could not start (both ports taken): when, and as what; not
+    /// tried again for a while.
+    studio_failed: Option<(Instant, (bool, String))>,
     /// Servers found on the network by the last search, and whether one runs.
     servers: Arc<Mutex<(bool, Vec<ui::FoundServer>)>>,
     /// Engine reads have waited for the server since then.
@@ -412,8 +527,27 @@ impl App {
             let page = self.ui.page();
             // Before the game the loop sleeps until there is input or the UI
             // animates; with it, it keeps the touch controls and pads current.
-            let wait = if self.game.is_some() { Duration::from_millis(8) } else { self.ui.idle_for() };
+            // In the background no frame is drawn, so a repaint due would
+            // never be taken: no busy loop for it (iOS: inactive under
+            // Control Center or an alert, for as long as that lasts).
+            // Before the game on a desktop with a controller, the loop reads
+            // it (at the pages' pace) rather than SDL every millisecond.
+            let read_pads = !MOBILE && self.game.is_none() && self.pads.any();
+            self.pads.read_by_loop(read_pads);
+            let wait = if self.game.is_some() {
+                Duration::from_millis(8)
+            } else if self.lifecycle.background.load(Ordering::Relaxed) {
+                Duration::from_millis(250)
+            } else if read_pads {
+                self.ui.idle_for().min(PAD_READ)
+            } else {
+                self.ui.idle_for()
+            };
+            if MOBILE {
+                self.offer_to_save();
+            }
             let first = wait_event(&mut self.events, wait);
+            self.pads.read();
             let events: Vec<Event> = first.into_iter().chain(self.events.poll_iter()).collect();
             for event in events {
                 if self.event(event) {
@@ -437,6 +571,9 @@ impl App {
             Event::Quit { .. } => return true,
             Event::GamepadAdded { which, .. } => self.pads.added(*which),
             Event::GamepadRemoved { which, .. } => self.pads.removed(*which),
+            // A phone's on-screen keyboard types keys too: not a keyboard
+            // taking over from the touch controls.
+            Event::KeyDown { .. } if MOBILE && self.typing.is_some() => {}
             Event::KeyDown { .. } | Event::MouseButtonDown { .. } | Event::GamepadButtonDown { .. } => {
                 self.touch_input = false
             }
@@ -451,7 +588,12 @@ impl App {
         }
         // The Siri Remote's touch surface moves like a pad's stick (SDL makes
         // the remote a gamepad); its touches are not on the screen.
-        if TV && matches!(event, Event::FingerDown { .. } | Event::FingerMotion { .. } | Event::FingerUp { .. }) {
+        if TV
+            && matches!(
+                event,
+                Event::FingerDown { .. } | Event::FingerMotion { .. } | Event::FingerUp { .. } | Event::FingerCanceled { .. }
+            )
+        {
             return false;
         }
         if let Event::FingerDown { x, y, .. } = event {
@@ -516,6 +658,7 @@ impl App {
             Event::FingerDown { finger_id, x, y, .. } => self.touch.finger_down(finger_id, x, y),
             Event::FingerMotion { finger_id, x, y, .. } => self.touch.finger_motion(finger_id, x, y),
             Event::FingerUp { finger_id, .. } => self.touch.finger_up(finger_id),
+            Event::FingerCanceled { finger_id, .. } => self.touch.finger_cancel(finger_id),
             _ => {}
         }
         if let Some(game) = &self.game
@@ -531,6 +674,13 @@ impl App {
     fn update(&mut self, page_before: Option<Page>) -> Result<bool> {
         self.keep_sources();
         self.update_studio();
+        // A mod asked for its menu (`menu:show()`): not while something is
+        // typed (nor over another page, `show_mod_menu`).
+        if let Some((module, menu)) = glue5_mods::take_menu_show()
+            && self.typing.is_none()
+        {
+            self.ui.show_mod_menu(&module, menu);
+        }
         let in_game = self.game.is_some();
         // Touch controls: a virtual pad in slot 0 unless a controller has it.
         let show = in_game
@@ -603,10 +753,10 @@ impl App {
                 }
                 self.touch_mouse = mouse;
             }
-            if self.settings.haptics {
-                haptics::rumble(glue5_runtime::input::rumble(0));
-            }
         }
+        // The game's rumble while the touch controls play; stopped as soon as
+        // they hide or haptics go off (a vibration plays until told to stop).
+        haptics::rumble(if show && self.settings.haptics { glue5_runtime::input::rumble(0) } else { (0, 0) });
 
         // While the touch controls are pad 0, a controller in slot 0 waits.
         let report = self.pads.update(self.ui.is_open(), show);
@@ -624,7 +774,14 @@ impl App {
         self.presentation.set_vsync(self.settings.vsync);
         self.presentation.set_metal_hud(self.settings.overlay == PerfOverlay::MetalHud);
         glue5_gpu::perf::set_on(in_game && self.settings.overlay == PerfOverlay::Glue5);
+        #[cfg(target_os = "ios")]
+        self.watch_thermal();
         self.presentation.set_frame_rate(self.settings.max_fps);
+        #[cfg(target_os = "android")]
+        if self.asked_rate != Some(self.settings.max_fps) {
+            self.asked_rate = Some(self.settings.max_fps);
+            ask_frame_rate(&self.window, self.settings.max_fps);
+        }
         self.presentation.set_upscaler(upscaler(&self.settings));
         self.presentation.set_sharpness(self.settings.sharpness);
         self.presentation.set_frame_generation(self.settings.frame_generation);
@@ -636,6 +793,7 @@ impl App {
         let stream = stream.as_ref().map(|c| (c.server(), c.status()));
         let stream_alert = self.stream_alert(stream.as_ref().map(|(_, s)| s));
         let servers = self.servers.lock().unwrap().clone();
+        self.ui.keyboard(crate::keyboard::overlap(&self.window));
         if in_game || (!self.lifecycle.background.load(Ordering::Relaxed) && self.ui.wants_frame()) {
             let status = Status {
                 game_dir: self.game_dir.as_deref(),
@@ -663,17 +821,21 @@ impl App {
                 servers: &servers.1,
                 searching: servers.0,
                 stream_alert,
+                drivers: self.drivers.as_ref(),
             };
             // The settings button: on touch screens always, so that it stays
             // with a controller in use or the touch controls off.
             let gear =
                 (in_game && (TOUCH || show)).then_some(if show { self.settings.touch_opacity } else { GEAR_ALONE });
             actions = self.ui.frame(&self.window, &mut self.settings, &status, show.then_some(&self.touch), gear);
-            if let Some(screen) = &mut self.screen
-                && !screen.show_ui()
-            {
-                // Not shown (the window not visible yet, ...): again soon.
-                self.ui.repaint_in(Duration::from_millis(100));
+            if let Some(screen) = &mut self.screen {
+                if !screen.show_ui() {
+                    // Not shown (the window not visible yet, ...): again soon.
+                    self.ui.repaint_in(Duration::from_millis(100));
+                } else if self.driver_mark {
+                    self.driver_mark = false;
+                    drivers::shown(&self.user_dir);
+                }
             }
         }
         for action in actions {
@@ -687,7 +849,7 @@ impl App {
                     }
                     self.play()?;
                 }
-                Action::ChooseGame => self.folder = Some(FolderPick::start(&self.window)),
+                Action::ChooseGame => self.folder = Some(Pick::folder(&self.window)),
                 Action::FindGame => self.find_game(None),
                 Action::ResetGraphics => self.reset_graphics(),
                 Action::JoinFriend { key, lobby } => {
@@ -714,12 +876,24 @@ impl App {
                     self.settings.source = Source::Server;
                     self.settings.save(&self.user_dir);
                 }
+                Action::AddDriver => self.driver_pick = Some(Pick::zip(&self.window)),
+                Action::RemoveDriver(id) => {
+                    drivers::remove(&self.user_dir, &id);
+                    if self.settings.gpu_driver.as_deref() == Some(id.as_str()) {
+                        self.settings.gpu_driver = None;
+                    }
+                    self.settings.save(&self.user_dir);
+                    if let Some(d) = &mut self.drivers {
+                        d.packages = drivers::list(&self.user_dir);
+                    }
+                }
             }
         }
+        self.add_driver();
         if self.play_requested {
             self.play()?;
         }
-        if let Some(choice) = self.folder.as_ref().and_then(FolderPick::poll) {
+        if let Some(choice) = self.folder.as_ref().and_then(Pick::poll) {
             self.folder = None;
             self.chosen(choice);
         }
@@ -727,10 +901,12 @@ impl App {
         let page = self.ui.page();
         if page != page_before {
             if let Some(input) = self.game.as_ref().and_then(|g| g.input.as_ref()) {
-                // Nothing stays pressed in the game behind a page.
+                // Nothing stays pressed in the game behind a page (nor for
+                // the mods).
                 input.release_all();
+                glue5_mods::input::release_all();
             }
-            if matches!(page_before, Some(Page::Settings | Page::Servers)) {
+            if matches!(page_before, Some(Page::Settings | Page::Servers | Page::Mods)) {
                 self.settings.save(&self.user_dir);
             }
         }
@@ -769,6 +945,9 @@ impl App {
         if typing != self.typing {
             if self.typing.is_some() {
                 self.text_input.stop(&self.window);
+            }
+            if let Some(typing) = typing {
+                crate::keyboard::typing(matches!(typing, Typing::App(_)));
             }
             if let Some(typing) = typing
                 && let Err(e) = self.text_input.start_with_options(&self.window, typing.options())
@@ -884,7 +1063,7 @@ impl App {
         let s = &self.settings;
         let back_buffer = settings::render_size(self.window.size_in_pixels(), s.render_scale(), s.low_memory);
         if s.mods {
-            glue5_mods::install(&self.user_dir.join("mods"));
+            glue5_mods::install(&paths::mods_dir(&self.user_dir));
         }
         let game = glue5_runtime::start(
             glue5_runtime::Config {
@@ -898,9 +1077,11 @@ impl App {
                 benchmark: self.mode == Mode::Benchmark,
                 low_memory: s.low_memory,
                 max_fps: s.max_fps,
-                online: (self.mode == Mode::Online).then(|| glue5_runtime::Online {
+                // The story with the network up: GTA Online from its pause menu.
+                online: matches!(self.mode, Mode::Story | Mode::Online).then(|| glue5_runtime::Online {
                     name: s.online_name.trim().into(),
                     lobby: self.join.take().unwrap_or_default(),
+                    freemode: self.mode == Mode::Online,
                 }),
                 language: preferred_language(),
             },
@@ -978,6 +1159,46 @@ impl App {
         }
     }
 
+    /// The driver package picked (Settings › Video), unpacked by a thread of
+    /// its own: a zip of tens of megabytes, from wherever the picker found it.
+    fn add_driver(&mut self) {
+        if let Some(choice) = self.driver_pick.as_ref().and_then(Pick::poll) {
+            self.driver_pick = None;
+            if let Some(path) = choice {
+                let user_dir = self.user_dir.clone();
+                self.driver_adding = Some(std::thread::spawn(move || {
+                    use std::io::Read;
+                    let mut zip = Vec::new();
+                    let mut file = sdl3::iostream::IOStream::from_file(&path, "r").map_err(|e| e.to_string())?;
+                    file.read_to_end(&mut zip).map_err(|e| e.to_string())?;
+                    drivers::add(&user_dir, &zip)
+                }));
+                if let Some(d) = &mut self.drivers {
+                    d.adding = true;
+                }
+            }
+        }
+        if !self.driver_adding.as_ref().is_some_and(std::thread::JoinHandle::is_finished) {
+            if self.driver_adding.is_some() {
+                self.ui.repaint_in(Duration::from_millis(200));
+            }
+            return;
+        }
+        let added = self.driver_adding.take().and_then(|t| t.join().ok()).unwrap_or(Err("it failed".into()));
+        match added {
+            Ok(p) => {
+                self.ui.note(format!("{} added: Glue 5 runs on it from the next launch.", p.name));
+                self.settings.gpu_driver = Some(p.id);
+                self.settings.save(&self.user_dir);
+            }
+            Err(e) => self.ui.note(format!("Cannot add the GPU driver: {e}")),
+        }
+        if let Some(d) = &mut self.drivers {
+            d.adding = false;
+            d.packages = drivers::list(&self.user_dir);
+        }
+    }
+
     /// The game's graphics settings back to the engine's defaults (asked for
     /// on the start page).
     fn reset_graphics(&mut self) {
@@ -999,13 +1220,39 @@ impl App {
         // Android gave the window a new native surface (SDL has updated the
         // window's handle to it already).
         #[cfg(target_os = "android")]
-        self.replace_surface();
+        {
+            self.replace_surface();
+            self.asked_rate = None;
+        }
+        // iOS may take back a suspended app's listening sockets: the Studio
+        // starts again (on the next update) on a new one. Not after it was
+        // only inactive (its browsers would lose their connections).
+        if self.lifecycle.suspended.swap(false, Ordering::Relaxed) && cfg!(any(target_os = "ios", target_os = "tvos")) {
+            self.studio = None;
+        }
         self.ui.repaint();
         // The game's files may have been copied in meanwhile (Finder, the
         // Files app, adb). Not for a server, whose copy is found once ready.
         if self.game.is_none() && self.game_dir.is_none() && self.settings.source == Source::Folder {
             self.find_game(None);
         }
+    }
+
+    /// Logs the phone's thermal state when it changes (asked once a second):
+    /// hot (serious within a minute of play on an iPhone 16 Pro), iOS holds
+    /// the game to its efficiency cores and frames take 20-50 ms, which
+    /// tests and logs should know.
+    #[cfg(target_os = "ios")]
+    fn watch_thermal(&mut self) {
+        if self.thermal.1.is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        let state = objc2_foundation::NSProcessInfo::processInfo().thermalState().0;
+        if state != self.thermal.0 {
+            const NAMES: [&str; 4] = ["nominal", "fair", "serious", "critical"];
+            log::info!("thermal: {}", NAMES.get(state as usize).copied().unwrap_or("?"));
+        }
+        self.thermal = (state, Some(Instant::now()));
     }
 
     /// A surface for the window's current native surface, for the renderer
@@ -1024,12 +1271,22 @@ impl App {
         }
     }
 
-    /// The settings, and the stream's index (the app ends).
+    /// What a trip to the background saves ([`Lifecycle::save`]): as now.
+    fn offer_to_save(&self) {
+        let mut to = self.lifecycle.to_save.lock().unwrap();
+        if to.settings.as_ref().is_none_or(|(settings, _)| *settings != self.settings) {
+            to.settings = Some((self.settings.clone(), self.user_dir.clone()));
+        }
+        to.stream = self.stream.as_ref().map_or_else(std::sync::Weak::new, Arc::downgrade);
+    }
+
+    /// The settings, the stream's index and the friends (the app ends).
     fn save(&self) {
         self.settings.save(&self.user_dir);
         if let Some(stream) = &self.stream {
             stream.flush();
         }
+        glue5_runtime::friends::flush();
     }
 
     /// Follows the settings: the game's files from a folder or a server
@@ -1116,17 +1373,33 @@ impl App {
     /// while it is on.
     fn update_studio(&mut self) {
         if self.settings.mods && glue5_mods::dir().is_none() {
-            glue5_mods::open(&self.user_dir.join("mods"));
+            glue5_mods::open(&paths::mods_dir(&self.user_dir));
         }
-        let wanted = (self.settings.mods && glue5_mods::dir().is_some() && self.settings.studio).then_some(self.settings.studio_lan);
-        if self.studio.as_ref().map(|(s, _)| s.lan()) == wanted {
+        // None yet, "New" pressed, or not a code (an edited settings file).
+        let code = match glue5_mods::studio::normalize(&self.settings.studio_code) {
+            Some(code) => code,
+            None => {
+                self.settings.studio_code = glue5_mods::studio::new_code();
+                self.settings.save(&self.user_dir);
+                self.settings.studio_code.clone()
+            }
+        };
+        let wanted = (self.settings.mods && glue5_mods::dir().is_some() && self.settings.studio)
+            .then(|| (self.settings.studio_lan, code.clone()));
+        if self.studio.as_ref().map(|(s, _)| (s.lan(), s.token().to_string())) == wanted {
+            return;
+        }
+        if let (Some((at, tried)), Some(w)) = (&self.studio_failed, &wanted)
+            && tried == w
+            && at.elapsed() < Duration::from_secs(10)
+        {
             return;
         }
         self.studio = None;
-        if let Some(lan) = wanted {
+        if let Some((lan, code)) = wanted {
             // The usual port, else any (another app has it).
-            let started = glue5_mods::studio::Studio::start(glue5_mods::studio::PORT, lan)
-                .or_else(|_| glue5_mods::studio::Studio::start(0, lan));
+            let started = glue5_mods::studio::Studio::start(glue5_mods::studio::PORT, lan, &code)
+                .or_else(|_| glue5_mods::studio::Studio::start(0, lan, &code));
             match started {
                 Ok(studio) => {
                     let host = if lan {
@@ -1140,8 +1413,12 @@ impl App {
                         lan,
                     };
                     self.studio = Some((studio, info));
+                    self.studio_failed = None;
                 }
-                Err(e) => log::warn!("studio: {e}"),
+                Err(e) => {
+                    log::warn!("studio: {e}");
+                    self.studio_failed = Some((Instant::now(), (lan, code)));
+                }
             }
         }
         self.ui.repaint();
@@ -1196,6 +1473,12 @@ impl App {
                 && let Err(e) = glue5_stream::cache::clear(&cache)
             {
                 log::warn!("stream: deleting the copy in the cache: {e}");
+            }
+            // Out of the backups (iOS), now that it is there: moved, or
+            // made here for the stream to fill.
+            if streaming {
+                let _ = std::fs::create_dir_all(&root);
+                paths::keep_out_of_backups(&root);
             }
         });
         self.stream = server.map(|server| {
@@ -1274,7 +1557,7 @@ impl App {
             }
             s.0 = true;
         }
-        let spawned = std::thread::Builder::new().name("find servers".into()).spawn(move || {
+        let spawned = glue5_runtime::qos::spawn("find servers", glue5_runtime::qos::Qos::Utility, move || {
             let mut found = glue5_stream::discovery::find(Duration::from_secs(3));
             // In the same order at every search (the page searches all the
             // while), shown at once with what they answered last time; each
@@ -1321,6 +1604,7 @@ impl App {
             .chain(paths::default_game_dirs())
             .chain(paths::download_dir(&self.user_dir));
         if let Some(dir) = candidates.filter(|d| is_game_dir(d)).find_map(|d| paths::canonical(&d).ok()) {
+            paths::keep_out_of_backups(&dir);
             self.settings.game_dir = Some(dir.clone());
             self.game_dir = Some(dir);
         }
@@ -1406,6 +1690,17 @@ fn wait_event(events: &mut sdl3::EventPump, timeout: Duration) -> Option<Event> 
 }
 
 /// The refresh rate of the window's display (60 if unknown).
+/// Asks Android to refresh the window's surface at the frame cap.
+#[cfg(target_os = "android")]
+fn ask_frame_rate(window: &sdl3::video::Window, fps: u32) {
+    use sdl3::sys::properties::SDL_GetPointerProperty;
+    use sdl3::sys::video::{SDL_GetWindowProperties, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER};
+    let native = unsafe {
+        SDL_GetPointerProperty(SDL_GetWindowProperties(window.raw()), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, std::ptr::null_mut())
+    };
+    glue5_runtime::qos::ask_frame_rate(native, fps);
+}
+
 fn window_refresh_rate(window: &sdl3::video::Window) -> f32 {
     let rate = window.get_display().ok().and_then(|d| d.get_mode().ok()).map_or(0.0, |m| m.refresh_rate);
     if rate > 0.0 { rate } else { 60.0 }
@@ -1464,12 +1759,25 @@ fn game_input(
             let (ww, wh) = window.size();
             input.mouse_position((x * bw / ww as f32) as i32, (y * bh / wh as f32) as i32);
             input.mouse_motion(xrel.round() as i32, yrel.round() as i32);
+            glue5_mods::input::mouse_position(x / ww.max(1) as f32, y / wh.max(1) as f32);
         }
-        Event::MouseButtonDown { mouse_btn, .. } => input.mouse_button(mouse_bit(mouse_btn), true),
-        Event::MouseButtonUp { mouse_btn, .. } => input.mouse_button(mouse_bit(mouse_btn), false),
-        Event::MouseWheel { y, .. } => input.mouse_wheel(y.round() as i32),
+        Event::MouseButtonDown { mouse_btn, .. } => {
+            input.mouse_button(mouse_bit(mouse_btn), true);
+            glue5_mods::input::mouse_button(mouse_bit(mouse_btn), true);
+        }
+        Event::MouseButtonUp { mouse_btn, .. } => {
+            input.mouse_button(mouse_bit(mouse_btn), false);
+            glue5_mods::input::mouse_button(mouse_bit(mouse_btn), false);
+        }
+        Event::MouseWheel { y, .. } => {
+            input.mouse_wheel(y.round() as i32);
+            glue5_mods::input::mouse_wheel(y.round() as i32);
+        }
         Event::Window { win_event: WindowEvent::FocusGained, .. } => input.focus(true),
-        Event::Window { win_event: WindowEvent::FocusLost, .. } => input.focus(false),
+        Event::Window { win_event: WindowEvent::FocusLost, .. } => {
+            input.focus(false);
+            glue5_mods::input::release_all();
+        }
         _ => {}
     }
 }
@@ -1496,6 +1804,8 @@ fn relaunch(play: bool) {
 fn key(input: &InputBlock, sc: sdl3::keyboard::Scancode, down: bool) {
     if let Some(vk) = keymap::vk(sc) {
         input.key(vk, down);
+        // The key itself for the mods, not its generic code or alias.
+        glue5_mods::input::key(vk, down);
         if let Some(generic) = keymap::generic(vk) {
             input.key(generic, down);
         }
@@ -1516,21 +1826,54 @@ fn mouse_bit(b: MouseButton) -> u32 {
     }
 }
 
-/// The system's folder picker, answered asynchronously (SDL calls back on
-/// the main thread while events are pumped).
-struct FolderPick(Arc<Mutex<Option<Option<PathBuf>>>>);
+/// What the settings show of the GPU drivers the user can add: on Android
+/// with an Adreno GPU (Qualcomm's), or once some were added; `fallback`,
+/// why the one chosen does not run.
+fn gpu_drivers(
+    user_dir: &Path,
+    settings: &Settings,
+    info: &wgpu::AdapterInfo,
+    fallback: Option<String>,
+) -> Option<drivers::Drivers> {
+    const QUALCOMM: u32 = 0x5143;
+    let packages = drivers::list(user_dir);
+    if !cfg!(target_os = "android") || (info.vendor != QUALCOMM && packages.is_empty() && fallback.is_none()) {
+        return None;
+    }
+    // Its version, as the driver gives it (Qualcomm's: its build, date,
+    // compiler...).
+    let version = info.driver_info.split(',').next().map(str::trim).filter(|v| !v.is_empty());
+    let running = version.unwrap_or(&info.driver).chars().take(60).collect();
+    Some(drivers::Drivers { packages, in_use: settings.gpu_driver.clone(), running, adding: false, fallback })
+}
 
-impl FolderPick {
-    fn start(window: &sdl3::video::Window) -> FolderPick {
-        let picked: Arc<Mutex<Option<Option<PathBuf>>>> = Default::default();
+/// The system's folder or file picker, answered asynchronously (SDL calls
+/// back on the main thread while events are pumped).
+struct Pick(Picked);
+
+type Picked = Arc<Mutex<Option<Option<PathBuf>>>>;
+
+impl Pick {
+    fn folder(window: &sdl3::video::Window) -> Pick {
+        let picked = Picked::default();
+        sdl3::dialog::show_open_folder_dialog(None::<&str>, false, window, Pick::answer(&picked));
+        Pick(picked)
+    }
+
+    /// A zip file (Android: a content:// URI, which SDL opens too).
+    fn zip(window: &sdl3::video::Window) -> Pick {
+        let picked = Picked::default();
+        let filters = [sdl3::dialog::DialogFileFilter { name: "Zip archives", pattern: "zip" }];
+        if let Err(e) = sdl3::dialog::show_open_file_dialog(&filters, None::<&str>, false, window, Pick::answer(&picked)) {
+            log::warn!("no file picker: {e:?}");
+            *picked.lock().unwrap() = Some(None);
+        }
+        Pick(picked)
+    }
+
+    fn answer(picked: &Picked) -> sdl3::dialog::DialogCallback {
         let slot = picked.clone();
-        sdl3::dialog::show_open_folder_dialog(
-            None::<&str>,
-            false,
-            window,
-            Box::new(move |result, _| *slot.lock().unwrap() = Some(result.ok().and_then(|mut v| v.pop()))),
-        );
-        FolderPick(picked)
+        Box::new(move |result, _| *slot.lock().unwrap() = Some(result.ok().and_then(|mut v| v.pop())))
     }
 
     /// `Some(choice)` once answered (`Some(None)`: cancelled).

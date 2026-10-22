@@ -34,6 +34,11 @@
 //! (`may_enter`): until the lobby's players are known, and while another
 //! player who started at the same time goes first and hosts.
 //!
+//! A player greets back, keeps or introduces to the others only someone
+//! who proved it receives at the address its greeting came from
+//! (`Cookies`): a greeting with someone else's address as its source gets
+//! that address a datagram no larger than the greeting, nothing more.
+//!
 //! The socket is the player's from the application's start: friends meet
 //! on it too (friends/), before and besides any lobby. A player can be in
 //! more than one lobby at a time: its game's, and a friend's it was
@@ -43,13 +48,16 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
+use crate::Locked;
 use crate::dht::{self, Dht};
+use crate::exit;
 
 /// The lobby ports, also the ports looked at for players on the same
 /// network: several players on one machine take the next free one.
@@ -63,6 +71,9 @@ const DATA: u8 = 3;
 /// A datagram that only opens this player's NAT to where it goes (nobody
 /// answers it).
 const OPEN: u8 = 4;
+/// The answer to a greeting without the cookie of its address: the cookie,
+/// to greet with again (see `Cookies`).
+const COOKIE: u8 = 5;
 /// Kinds of datagram from here on are the friends' (friends/).
 pub(crate) const FRIENDS: u8 = 10;
 /// HELLO flags: please answer; the player is about to look for a session;
@@ -70,8 +81,21 @@ pub(crate) const FRIENDS: u8 = 10;
 const ASK: u8 = 1;
 const WAITING: u8 = 2;
 const PLAYING: u8 = 4;
+/// A greeting answering a cookie: never answered by a cookie (two players
+/// would send each other cookies for ever).
+const ANSWER: u8 = 8;
+/// A greeting after the kind: the lobby, the player's id, address and
+/// flags, the cookie the player greeted gave for the address it comes from
+/// (zero when none yet), the cookie of the address it goes to; then the
+/// player's card. A cookie's datagram is as large as the smallest
+/// greeting: the greeting it gets back is not larger.
+const HELLO_LEN: usize = 8 + 8 + 4 + 1 + 8 + 8;
+const HELLO_SIZE: usize = MAGIC.len() + 1 + HELLO_LEN;
 /// How often players greet each other (keeping the NATs' mappings open),
 /// and when a silent one is gone.
+/// The network thread's clock: the DHT's and the friends' ticks (nothing
+/// is due sooner; a datagram ends the wait at once).
+const TICK: Duration = Duration::from_millis(250);
 const KEEPALIVE: Duration = Duration::from_secs(2);
 const GONE: Duration = Duration::from_secs(20);
 /// How long an address is tried before giving up on it.
@@ -88,6 +112,16 @@ const HOSTING: Duration = Duration::from_secs(6);
 const PATIENCE: Duration = Duration::from_secs(30);
 /// Lobbies at most at a time: the game's and friends' visited.
 const LOBBIES: usize = 4;
+/// Players known per lobby, and addresses being reached, at most: bounds
+/// for floods of strangers' greetings, well above what lobbies hold (the
+/// public one has every player looking for a session at once).
+const PLAYERS: usize = 512;
+const TRYING: usize = 1024;
+/// Addresses kept per player it greeted from, and of this player's own.
+const SEEN: usize = 4;
+const OWN: usize = 16;
+/// How long a cookie holds: one to two of these.
+const COOKIE_EPOCH: Duration = Duration::from_secs(60);
 /// How often a lobby's players are asked for on the DHT (a player who
 /// cannot greet this one is reached only once this one hears of it).
 const LOBBY_REFRESH: Duration = Duration::from_secs(10);
@@ -121,7 +155,9 @@ struct Lobby {
 
 impl Lobby {
     fn new(name: &str, now: Instant) -> Lobby {
-        let key: [u8; 32] = Sha256::digest(format!("glue5 lobby 1 {} {name}", crate::GAME_BUILD)).into();
+        // 2: greetings with cookies (players of the builds before are in
+        // lobbies of their own: they would greet without).
+        let key: [u8; 32] = Sha256::digest(format!("glue5 lobby 2 {} {name}", crate::GAME_BUILD)).into();
         Lobby { name: name.to_owned(), id: key[..8].try_into().unwrap(), key: key[..20].try_into().unwrap(), joined: now }
     }
 }
@@ -142,7 +178,7 @@ static CARD: Mutex<Option<Card>> = Mutex::new(None);
 
 /// This player's card, from now on.
 pub(crate) fn set_card(card: Card) {
-    *CARD.lock().unwrap() = Some(card);
+    *CARD.locked() = Some(card);
 }
 
 impl Card {
@@ -172,8 +208,10 @@ struct Peer {
     lobby: LobbyId,
     /// What it says about itself.
     card: Option<Card>,
-    /// Where its datagrams come from, when they do.
+    /// Where its datagrams come from, when they do, and the last few
+    /// addresses it greeted from (a LAN's and the Internet's).
     addr: Option<SocketAddrV4>,
+    seen: Vec<SocketAddrV4>,
     /// When it was last heard from directly, or introduced.
     heard: Instant,
     introduced: Instant,
@@ -187,7 +225,7 @@ struct Peer {
 impl Peer {
     fn new(vip: u32, lobby: LobbyId, now: Instant) -> Peer {
         let heard = now.checked_sub(GONE).unwrap_or(now);
-        Peer { vip, lobby, card: None, addr: None, heard, introduced: now, via: None, flags: 0, playing: None }
+        Peer { vip, lobby, card: None, addr: None, seen: Vec::new(), heard, introduced: now, via: None, flags: 0, playing: None }
     }
 
     fn direct(&self, now: Instant) -> bool {
@@ -244,6 +282,82 @@ fn nearness(addr: SocketAddrV4) -> u8 {
     }
 }
 
+/// Return routability, without keeping anything for strangers: a player
+/// answers a greeting in full, and keeps its sender, only when it carries
+/// the cookie of the address it comes from, a MAC of that address and the
+/// time under a secret of this process. Else it answers with the cookie
+/// alone: who greets again with it receives at that address. Each
+/// greeting also gives the cookie of the address it goes to, which the
+/// player there greets back with: once one side has the other's cookie, a
+/// round trip proves both addresses (two players behind NATs, both
+/// greeting first, get there too: each answers the other's cookie). A
+/// broadcast's cookie is no address's: the players on the network answer
+/// it with theirs.
+struct Cookies {
+    secret: [u8; 32],
+    born: Instant,
+}
+
+impl Cookies {
+    fn new(now: Instant) -> Cookies {
+        let mut secret = [0; 32];
+        getrandom::fill(&mut secret).expect("the system's random numbers");
+        Cookies { secret, born: now }
+    }
+
+    fn epoch(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.born).as_secs() / COOKIE_EPOCH.as_secs()
+    }
+
+    fn at(&self, addr: SocketAddrV4, epoch: u64) -> [u8; 8] {
+        use blake2::digest::Mac;
+        let mut mac = blake2::Blake2sMac::<blake2::digest::consts::U8>::new_from_slice(&self.secret).unwrap();
+        mac.update(&epoch.to_be_bytes());
+        mac.update(&addr.ip().octets());
+        mac.update(&addr.port().to_be_bytes());
+        mac.finalize().into_bytes().into()
+    }
+
+    /// The cookie of `addr` now.
+    fn of(&self, addr: SocketAddrV4, now: Instant) -> [u8; 8] {
+        self.at(addr, self.epoch(now))
+    }
+
+    /// Whether `cookie` is `addr`'s, of now or of the epoch before.
+    fn check(&self, addr: SocketAddrV4, cookie: &[u8; 8], now: Instant) -> bool {
+        let epoch = self.epoch(now);
+        *cookie == self.at(addr, epoch) || epoch > 0 && *cookie == self.at(addr, epoch - 1)
+    }
+}
+
+/// A greeting, read.
+struct Hello {
+    lobby: LobbyId,
+    id: u64,
+    vip: u32,
+    flags: u8,
+    /// The cookie it carries (of the address it comes from, if right), and
+    /// the one it gives (of this player's address, to greet back with).
+    cookie: [u8; 8],
+    gives: [u8; 8],
+    card: Option<Card>,
+}
+
+impl Hello {
+    fn read(d: &[u8]) -> Option<Hello> {
+        let h = d.get(..HELLO_LEN)?;
+        Some(Hello {
+            lobby: h[..8].try_into().unwrap(),
+            id: u64::from_be_bytes(h[8..16].try_into().unwrap()),
+            vip: u32::from_be_bytes(h[16..20].try_into().unwrap()),
+            flags: h[20],
+            cookie: h[21..29].try_into().unwrap(),
+            gives: h[29..37].try_into().unwrap(),
+            card: Card::read(&d[HELLO_LEN..]),
+        })
+    }
+}
+
 struct State {
     /// The game's lobby first, then the ones visited.
     lobbies: Vec<Lobby>,
@@ -251,8 +365,12 @@ struct State {
     peers: HashMap<u64, Peer>,
     /// Addresses tried, not answering yet: since when, for which lobby.
     trying: HashMap<SocketAddrV4, (Instant, LobbyId)>,
-    /// This player's own addresses (the DHT hands them out too).
+    /// This player's own addresses (the DHT hands them out too), proven
+    /// as any player's.
     own: HashSet<SocketAddrV4>,
+    /// The cookies the players at these addresses gave (`Cookies`), which
+    /// the greetings there carry.
+    given: HashMap<SocketAddrV4, [u8; 8]>,
     /// When players' addresses were last heard from, and the far ones not
     /// heard from yet.
     heard: HashMap<Ipv4Addr, Instant>,
@@ -264,6 +382,24 @@ struct State {
 impl State {
     fn lobby(&self, id: &LobbyId) -> Option<&Lobby> {
         self.lobbies.iter().find(|l| l.id == *id)
+    }
+
+    /// Whether an engine datagram from `from` comes from the player at
+    /// `src` on the virtual LAN: sent from one of its addresses (`Some(true)`),
+    /// or relayed by another player while it is not reached directly
+    /// (`Some(false)`). Never from this player's address (`own`) or a
+    /// broadcast's.
+    fn sender(&self, from: SocketAddrV4, src: u32, own: u32, now: Instant) -> Option<bool> {
+        if src == own || !is_player_vip(src) {
+            return None;
+        }
+        let at = |p: &Peer| p.addr == Some(from) || p.seen.contains(&from);
+        let mut players = self.peers.values().filter(|p| p.vip == src);
+        if players.clone().any(at) {
+            return Some(true);
+        }
+        let relay = self.peers.values().any(|p| at(p) && p.vip != src);
+        (relay && players.any(|p| !p.direct(now))).then_some(false)
     }
 
     /// A player's address from the DHT: a far one when its NAT changed the
@@ -317,6 +453,7 @@ pub struct P2p {
     flags: AtomicU8,
     waiting: Mutex<Option<Instant>>,
     state: Mutex<State>,
+    cookies: Cookies,
 }
 
 static P2P: OnceLock<P2p> = OnceLock::new();
@@ -332,7 +469,7 @@ fn bind(ports: impl IntoIterator<Item = u16>) -> std::io::Result<UdpSocket> {
         match UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)) {
             Ok(socket) => {
                 socket.set_broadcast(true)?;
-                socket.set_read_timeout(Some(Duration::from_millis(50)))?;
+                socket.set_read_timeout(Some(TICK))?;
                 return Ok(socket);
             }
             Err(e) => error = e,
@@ -344,7 +481,7 @@ fn bind(ports: impl IntoIterator<Item = u16>) -> std::io::Result<UdpSocket> {
 /// The player's socket and the thread serving it, started once.
 pub fn start() -> std::io::Result<&'static P2p> {
     static STARTING: Mutex<()> = Mutex::new(());
-    let _one = STARTING.lock().unwrap();
+    let _one = STARTING.locked();
     if let Some(p2p) = P2P.get() {
         return Ok(p2p);
     }
@@ -365,16 +502,18 @@ pub fn start() -> std::io::Result<&'static P2p> {
             peers: HashMap::new(),
             trying: HashMap::new(),
             own: Default::default(),
+            given: HashMap::new(),
             heard: HashMap::new(),
             far: HashMap::new(),
             introduced: Instant::now(),
             dht: Dht::new(dht_id, port),
         }),
+        cookies: Cookies::new(Instant::now()),
     };
     p2p.vip.store(free_vip(&[]), Ordering::Relaxed);
     let p2p = P2P.get_or_init(|| p2p);
     log::info!("p2p: port {port}, address {}", Ipv4Addr::from(p2p.vip.load(Ordering::Relaxed)));
-    std::thread::Builder::new().name("p2p".into()).spawn(move || p2p.run())?;
+    crate::qos::spawn("p2p", crate::qos::Qos::Initiated, move || p2p.run())?;
     Ok(p2p)
 }
 
@@ -397,16 +536,56 @@ fn is_broadcast(ip: u32) -> bool {
     ip == u32::MAX || (ip & 0xffff_0000 == NET && ip & 0xff == 0xff)
 }
 
+/// Whether a player may have `vip` (see `free_vip`).
+fn is_player_vip(vip: u32) -> bool {
+    vip & 0xffff_0000 == NET && !matches!(vip & 0xff, 0 | 0xff)
+}
+
 /// This device's address on its local network (the one its Internet
 /// traffic leaves from), when the network is a private one. Connecting a
-/// UDP socket sends nothing.
+/// UDP socket sends nothing. Not a phone's mobile data, whose private
+/// addresses are the carrier's (its /24 holds strangers, not players).
 pub(crate) fn lan_address() -> Option<Ipv4Addr> {
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).ok()?;
     socket.connect(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
     match socket.local_addr().ok()? {
-        SocketAddr::V4(a) if a.ip().is_private() => Some(*a.ip()),
+        SocketAddr::V4(a) if a.ip().is_private() && on_broadcast_network(*a.ip()) => Some(*a.ip()),
         _ => None,
     }
+}
+
+/// Whether `ip` is on a network with neighbours (Wi-Fi, Ethernet): its
+/// interface broadcasts and is not point-to-point, as mobile data's are.
+#[cfg(unix)]
+fn on_broadcast_network(ip: Ipv4Addr) -> bool {
+    let mut found = false;
+    // SAFETY: the list is walked as getifaddrs made it, then freed.
+    unsafe {
+        let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut list) != 0 {
+            return true;
+        }
+        let mut at = list;
+        while !at.is_null() {
+            let a = (*at).ifa_addr;
+            if !a.is_null() && (*a).sa_family as i32 == libc::AF_INET {
+                let sin = &*(a as *const libc::sockaddr_in);
+                if Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)) == ip {
+                    let flags = (*at).ifa_flags;
+                    found = flags & libc::IFF_BROADCAST as u32 != 0 && flags & libc::IFF_POINTOPOINT as u32 == 0;
+                    break;
+                }
+            }
+            at = (*at).ifa_next;
+        }
+        libc::freeifaddrs(list);
+    }
+    found
+}
+
+#[cfg(not(unix))]
+fn on_broadcast_network(_: Ipv4Addr) -> bool {
+    true
 }
 
 impl P2p {
@@ -449,7 +628,7 @@ impl P2p {
     /// this game build).
     pub fn join_lobby(&self, name: &str) {
         let now = Instant::now();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.locked();
         if state.lobbies.first().is_some_and(|l| l.name == name) {
             return;
         }
@@ -464,7 +643,7 @@ impl P2p {
     /// or a private one): the lobbies visited, and their players, are left.
     pub(crate) fn switch_lobby(&self, name: &str) {
         let now = Instant::now();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.locked();
         if state.lobbies.len() == 1 && state.lobbies[0].name == name {
             return;
         }
@@ -482,8 +661,22 @@ impl P2p {
         // looks for a session there (a private one has none to wait for).
         if name.is_empty() {
             self.flags.store(0, Ordering::Relaxed);
-            *self.waiting.lock().unwrap() = None;
+            *self.waiting.locked() = None;
         }
+    }
+
+    /// Leaves the lobbies and their players (the game is back in the story).
+    pub(crate) fn leave_lobbies(&self) {
+        let mut state = self.state.locked();
+        let state = &mut *state;
+        for lobby in state.lobbies.drain(..) {
+            state.dht.remove(&lobby.key);
+        }
+        state.peers.clear();
+        state.trying.clear();
+        self.flags.store(0, Ordering::Relaxed);
+        *self.waiting.locked() = None;
+        log::info!("p2p: out of the lobbies");
     }
 
     /// Visits a friend's lobby (`name`), the friend at `via` introducing
@@ -491,7 +684,7 @@ impl P2p {
     /// lobby visited makes room.
     pub(crate) fn visit_lobby(&self, name: &str, via: SocketAddrV4) {
         let now = Instant::now();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.locked();
         let lobby = Lobby::new(name, now);
         let id = lobby.id;
         if state.lobby(&id).is_none() {
@@ -513,13 +706,13 @@ impl P2p {
     /// answer.
     pub(crate) fn players(&self) -> Vec<(Card, SocketAddrV4)> {
         let now = Instant::now();
-        let state = self.state.lock().unwrap();
+        let state = self.state.locked();
         state.peers.values().filter(|p| p.direct(now)).filter_map(|p| Some((p.card.clone()?, p.addr?))).collect()
     }
 
     /// The lobbies the player is in (their names), the game's first.
     pub(crate) fn lobbies(&self) -> Vec<String> {
-        self.state.lock().unwrap().lobbies.iter().map(|l| l.name.clone()).collect()
+        self.state.locked().lobbies.iter().map(|l| l.name.clone()).collect()
     }
 
     /// Whether the engine may look for a session now (it asks until it
@@ -532,12 +725,12 @@ impl P2p {
             return true;
         }
         let now = Instant::now();
-        let since = *self.waiting.lock().unwrap().get_or_insert_with(|| {
+        let since = *self.waiting.locked().get_or_insert_with(|| {
             self.flags.store(WAITING, Ordering::Relaxed);
             log::info!("p2p: waiting for the lobby's players");
             now
         });
-        let state = self.state.lock().unwrap();
+        let state = self.state.locked();
         let Some(lobby) = state.lobbies.first() else { return true };
         let discovered = state.dht.settled(&lobby.key) || now - lobby.joined > DISCOVERY;
         let reaching = state.trying.values().any(|(_, l)| *l == lobby.id);
@@ -567,7 +760,7 @@ impl P2p {
         d.extend_from_slice(payload);
         const DST: std::ops::Range<usize> = MAGIC.len() + 7..MAGIC.len() + 11;
         let now = Instant::now();
-        let state = self.state.lock().unwrap();
+        let state = self.state.locked();
         let socket = self.socket();
         for peer in state.peers.values() {
             if peer.vip != dst && !is_broadcast(dst) {
@@ -593,7 +786,7 @@ impl P2p {
 
     /// The DHT, for the friends' lookups.
     pub(crate) fn dht<R>(&self, f: impl FnOnce(&mut Dht) -> R) -> R {
-        f(&mut self.state.lock().unwrap().dht)
+        f(&mut self.state.locked().dht)
     }
 
     /// Directly while the player answers there, else through who
@@ -602,17 +795,40 @@ impl P2p {
         if peer.direct(now) { peer.addr } else { peer.via.or(peer.addr) }
     }
 
+    /// Greets `to` with the cookie it gave, if any. The card only then:
+    /// before, the player there answers with a cookie alone.
     fn hello(&self, to: SocketAddrV4, flags: u8, lobby: &LobbyId) {
-        let mut d = Vec::with_capacity(32);
+        let cookie = self.state.locked().given.get(&to).copied();
+        self.hello_with(to, flags, lobby, cookie);
+    }
+
+    fn hello_with(&self, to: SocketAddrV4, flags: u8, lobby: &LobbyId, cookie: Option<[u8; 8]>) {
+        let mut d = Vec::with_capacity(HELLO_SIZE + 41 + CARD_NAME);
         d.extend_from_slice(&MAGIC);
         d.push(HELLO);
         d.extend_from_slice(lobby);
         d.extend_from_slice(&self.id.to_be_bytes());
         d.extend_from_slice(&self.vip.load(Ordering::Relaxed).to_be_bytes());
         d.push(flags | self.flags.load(Ordering::Relaxed));
-        if let Some(card) = CARD.lock().unwrap().as_ref() {
+        d.extend_from_slice(&cookie.unwrap_or_default());
+        d.extend_from_slice(&self.cookies.of(to, Instant::now()));
+        if cookie.is_some()
+            && flags & ANSWER == 0
+            && let Some(card) = CARD.locked().as_ref()
+        {
             card.write(&mut d);
         }
+        let _ = self.socket().send_to(&d, to);
+    }
+
+    /// The answer to a greeting without the cookie of `to`: the cookie.
+    fn cookie(&self, to: SocketAddrV4, lobby: &LobbyId, now: Instant) {
+        let mut d = Vec::with_capacity(HELLO_SIZE);
+        d.extend_from_slice(&MAGIC);
+        d.push(COOKIE);
+        d.extend_from_slice(lobby);
+        d.extend_from_slice(&self.cookies.of(to, now));
+        d.resize(HELLO_SIZE, 0);
         let _ = self.socket().send_to(&d, to);
     }
 
@@ -644,7 +860,13 @@ impl P2p {
             match received {
                 Ok((len, SocketAddr::V4(from))) => {
                     failing = 0;
-                    self.receive(from, &buf[..len]);
+                    // Anyone can send one: a mistake in reading it drops
+                    // the datagram, not the game.
+                    let d = &buf[..len];
+                    let read = exit::recoverable(|| catch_unwind(AssertUnwindSafe(|| self.receive(from, d))));
+                    if read.is_err() {
+                        log::warn!("p2p: a datagram from {from} could not be read");
+                    }
                 }
                 Ok(_) => failing = 0,
                 Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => failing = 0,
@@ -668,10 +890,10 @@ impl P2p {
                 }
             }
             let now = Instant::now();
-            if now - dht_ticked > Duration::from_millis(250) {
+            if now - dht_ticked >= TICK {
                 dht_ticked = now;
                 let mut out = dht::Output::default();
-                self.state.lock().unwrap().dht.tick(now, &mut out);
+                self.state.locked().dht.tick(now, &mut out);
                 self.dht_output(out);
                 crate::friends::tick(self, now);
             }
@@ -696,7 +918,7 @@ impl P2p {
             return;
         }
         let now = Instant::now();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.locked();
         let mut new = Vec::new();
         let mut friends = Vec::new();
         // This player (its announces, under other ports when its NAT gives
@@ -712,7 +934,10 @@ impl P2p {
                 friends.push((key, addr));
                 continue;
             };
-            if !state.trying.contains_key(&addr) && state.peers.values().all(|p| p.addr != Some(addr)) {
+            if !state.trying.contains_key(&addr)
+                && state.trying.len() < TRYING
+                && state.peers.values().all(|p| p.addr != Some(addr))
+            {
                 log::debug!("p2p: trying {addr}, from the DHT");
                 state.trying.insert(addr, (now, lobby));
                 new.push((addr, lobby));
@@ -728,7 +953,7 @@ impl P2p {
     }
 
     fn tick(&self, now: Instant) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.locked();
         let lobbies: Vec<LobbyId> = state.lobbies.iter().map(|l| l.id).collect();
         state.peers.retain(|id, p| {
             let alive = (now - p.heard < GONE || now - p.introduced < GONE) && lobbies.contains(&p.lobby);
@@ -738,6 +963,10 @@ impl P2p {
             alive
         });
         state.trying.retain(|_, (since, lobby)| now - *since < PUNCH && lobbies.contains(lobby));
+        // The cookies of the addresses still greeted.
+        let greeted: HashSet<SocketAddrV4> =
+            state.peers.values().flat_map(|p| p.seen.iter().copied().chain(p.addr)).chain(state.trying.keys().copied()).collect();
+        state.given.retain(|a, _| greeted.contains(a));
         let greet: Vec<(SocketAddrV4, LobbyId)> = state
             .peers
             .values()
@@ -797,7 +1026,7 @@ impl P2p {
     /// port, where broadcasts do not get through; the players there are
     /// introduced to the others by the one reached.
     fn sweep(&self) {
-        let lobbies: Vec<LobbyId> = self.state.lock().unwrap().lobbies.iter().map(|l| l.id).collect();
+        let lobbies: Vec<LobbyId> = self.state.locked().lobbies.iter().map(|l| l.id).collect();
         if lobbies.is_empty() {
             return;
         }
@@ -816,26 +1045,37 @@ impl P2p {
     fn receive(&self, from: SocketAddrV4, d: &[u8]) {
         if Dht::is_dht(d) {
             let mut out = dht::Output::default();
-            self.state.lock().unwrap().dht.receive(from, d, &mut out);
+            self.state.locked().dht.receive(from, d, &mut out);
             self.dht_output(out);
             return;
         }
         if d.len() < MAGIC.len() + 1 || d[..MAGIC.len()] != MAGIC {
             return;
         }
-        self.state.lock().unwrap().heard.insert(*from.ip(), Instant::now());
         let kind = d[MAGIC.len()];
         if kind >= FRIENDS {
+            // A far player's (`Far`) gets through: no more opening the way.
+            let mut state = self.state.locked();
+            if state.far.contains_key(from.ip()) {
+                state.heard.insert(*from.ip(), Instant::now());
+            }
+            drop(state);
             crate::friends::receive(self, from, kind, &d[MAGIC.len() + 1..]);
             return;
         }
         let d = &d[MAGIC.len() + 1..];
         match kind {
-            HELLO if d.len() >= 21 => {
+            HELLO => {
+                if let Some(hello) = Hello::read(d) {
+                    self.on_hello(from, hello);
+                }
+            }
+            // As large as the smallest greeting (see `HELLO_SIZE`).
+            COOKIE if d.len() >= HELLO_LEN => {
                 let lobby: LobbyId = d[..8].try_into().unwrap();
-                let id = u64::from_be_bytes(d[8..16].try_into().unwrap());
-                let vip = u32::from_be_bytes(d[16..20].try_into().unwrap());
-                self.on_hello(from, lobby, id, vip, d[20], Card::read(&d[21..]));
+                if self.state.locked().lobby(&lobby).is_some() {
+                    self.hello_with(from, ASK | ANSWER, &lobby, Some(d[8..16].try_into().unwrap()));
+                }
             }
             PEERS if d.len() >= 8 => {
                 let lobby: LobbyId = d[..8].try_into().unwrap();
@@ -858,16 +1098,17 @@ impl P2p {
                 let dst = u32::from_be_bytes(d[6..10].try_into().unwrap());
                 let dst_port = u16::from_be_bytes(d[10..12].try_into().unwrap());
                 let vip = self.vip.load(Ordering::Relaxed);
-                let state = self.state.lock().unwrap();
-                // Only from players of the lobbies.
-                if !state.peers.values().any(|p| p.addr == Some(from) || p.vip == src) {
-                    return;
-                }
+                let state = self.state.locked();
+                // Only from players of the lobbies, each in its own name: from
+                // where it is heard or greeted from (another of its
+                // addresses), or through a relay while it is not reached.
+                let Some(direct) = state.sender(from, src, vip, Instant::now()) else { return };
                 if dst == vip || is_broadcast(dst) {
                     drop(state);
                     crate::vnet::deliver(src, src_port, dst_port, &d[12..]);
-                } else if let Some(to) = state.peers.values().find(|p| p.vip == dst).and_then(|p| p.addr) {
-                    // A relay for two players who cannot reach each other.
+                } else if direct && let Some(to) = state.peers.values().find(|p| p.vip == dst).and_then(|p| p.addr) {
+                    // A relay for two players who cannot reach each other
+                    // (their own datagrams only: not relayed again).
                     let mut relayed = Vec::with_capacity(MAGIC.len() + 1 + d.len());
                     relayed.extend_from_slice(&MAGIC);
                     relayed.push(DATA);
@@ -879,18 +1120,33 @@ impl P2p {
         }
     }
 
-    fn on_hello(&self, from: SocketAddrV4, lobby: LobbyId, id: u64, vip: u32, flags: u8, card: Option<Card>) {
+    fn on_hello(&self, from: SocketAddrV4, hello: Hello) {
+        let Hello { lobby, id, vip, flags, cookie, gives, card } = hello;
         let now = Instant::now();
-        let mut state = self.state.lock().unwrap();
-        if state.lobby(&lobby).is_none() {
+        let mut state = self.state.locked();
+        if state.lobby(&lobby).is_none() || id == self.id && state.own.contains(&from) || id != self.id && !is_player_vip(vip) {
+            return;
+        }
+        if !self.cookies.check(from, &cookie, now) {
+            drop(state);
+            if flags & ANSWER == 0 {
+                self.cookie(from, &lobby, now);
+            }
             return;
         }
         state.trying.remove(&from);
+        state.heard.insert(*from.ip(), now);
         if id == self.id {
-            state.own.insert(from);
+            if state.own.len() < OWN {
+                state.own.insert(from);
+            }
             return;
         }
         let known = state.peers.contains_key(&id);
+        if !known && state.peers.values().filter(|p| p.lobby == lobby).count() >= PLAYERS {
+            return;
+        }
+        state.given.insert(from, gives);
         let heard_before = state.peers.get(&id).is_some_and(|p| p.addr.is_some());
         // Two players with one address: the one whose address the engine
         // has not taken yet takes another.
@@ -908,11 +1164,24 @@ impl P2p {
         if card.is_some() {
             peer.card = card;
         }
-        // The nearest of its addresses that answer.
-        if !peer.direct(now) || peer.addr.is_none_or(|a| nearness(from) <= nearness(a)) {
+        // The nearest of its addresses that answer: one heard lately is
+        // given up only for a nearer one (a greeting with its id from
+        // elsewhere would take its traffic), or once it has been quiet for
+        // more than a keepalive (the player moved: Wi-Fi to mobile data, a
+        // NAT that remapped; a spoofer cannot hold off its greetings).
+        let quiet = now - peer.heard > KEEPALIVE + KEEPALIVE / 2;
+        if !peer.direct(now) || quiet || peer.addr.is_none_or(|a| nearness(from) < nearness(a)) {
             peer.addr = Some(from);
         }
-        peer.heard = now;
+        if peer.addr == Some(from) {
+            peer.heard = now;
+        }
+        if !peer.seen.contains(&from) {
+            if peer.seen.len() >= SEEN {
+                peer.seen.remove(0);
+            }
+            peer.seen.push(from);
+        }
         // A player already playing when first heard has had its time.
         if flags & PLAYING != 0 && peer.playing.is_none() {
             let long_ago = now.checked_sub(HOSTING).unwrap_or(now);
@@ -943,26 +1212,36 @@ impl P2p {
 
     fn on_peers(&self, from: SocketAddrV4, lobby: LobbyId, about: &[(u64, u32, SocketAddrV4)]) {
         let now = Instant::now();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.locked();
         // Only a player of the lobby introduces others.
         if state.lobby(&lobby).is_none() || !state.peers.values().any(|p| p.addr == Some(from) && p.lobby == lobby) {
             return;
         }
         let mut punch = Vec::new();
         for &(id, vip, addr) in about {
-            if id == self.id {
+            if id == self.id || !is_player_vip(vip) {
                 continue;
             }
+            if !state.peers.contains_key(&id) && state.peers.values().filter(|p| p.lobby == lobby).count() >= PLAYERS {
+                continue;
+            }
+            let own = state.own.contains(&addr);
             let peer = state.peers.entry(id).or_insert(Peer::new(vip, lobby, now));
-            peer.vip = vip;
+            // What a player says of itself wins over what others say of it.
+            if !peer.direct(now) {
+                peer.vip = vip;
+            }
             peer.via = Some(from);
             peer.introduced = now;
-            if !peer.direct(now) && !state.own.contains(&addr) {
+            if !peer.direct(now) && !own {
                 punch.push(addr);
             }
         }
+        punch.truncate(TRYING.saturating_sub(state.trying.len()));
+        // (Introduced again and again, an address keeps the time it was
+        // first tried, and expires.)
         for addr in &punch {
-            state.trying.insert(*addr, (now, lobby));
+            state.trying.entry(*addr).or_insert((now, lobby));
         }
         drop(state);
         for addr in punch {
@@ -981,11 +1260,188 @@ mod tests {
             peers: HashMap::new(),
             trying: HashMap::new(),
             own: HashSet::new(),
+            given: HashMap::new(),
             heard: HashMap::new(),
             far: HashMap::new(),
             introduced: Instant::now(),
             dht: Dht::new([0; 20], 47000),
         }
+    }
+
+    /// A player on this machine, without its thread: the tests hand it the
+    /// datagrams its socket gets (`exchange`).
+    fn player() -> (P2p, SocketAddrV4) {
+        let (socket, addr) = socket();
+        let p = P2p {
+            socket: RwLock::new(socket),
+            port: AtomicU16::new(addr.port()),
+            id: random(),
+            vip: AtomicU32::new(free_vip(&[])),
+            vip_taken: AtomicBool::new(false),
+            flags: AtomicU8::new(0),
+            waiting: Mutex::new(None),
+            state: Mutex::new(state()),
+            cookies: Cookies::new(Instant::now()),
+        };
+        p.join_lobby("test");
+        (p, addr)
+    }
+
+    fn socket() -> (UdpSocket, SocketAddrV4) {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        socket.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
+        let SocketAddr::V4(addr) = socket.local_addr().unwrap() else { unreachable!() };
+        (socket, addr)
+    }
+
+    fn received(socket: &UdpSocket) -> Vec<Vec<u8>> {
+        let mut buf = [0; 2048];
+        std::iter::from_fn(|| socket.recv(&mut buf).ok().map(|len| buf[..len].to_vec())).collect()
+    }
+
+    /// Hands the players what they receive, until nothing comes.
+    fn exchange(players: &[&P2p]) {
+        let mut buf = [0; 2048];
+        loop {
+            let mut any = false;
+            for p in players {
+                loop {
+                    let r = p.socket().recv_from(&mut buf);
+                    let Ok((len, SocketAddr::V4(from))) = r else { break };
+                    p.receive(from, &buf[..len]);
+                    any = true;
+                }
+            }
+            if !any {
+                return;
+            }
+        }
+    }
+
+    fn lobby(p: &P2p) -> LobbyId {
+        p.state.locked().lobbies[0].id
+    }
+
+    /// A greeting as anyone may send it, without a card: the smallest.
+    fn greeting(lobby: &LobbyId, id: u64, flags: u8, cookie: [u8; 8]) -> Vec<u8> {
+        let mut d = MAGIC.to_vec();
+        d.push(HELLO);
+        d.extend_from_slice(lobby);
+        d.extend_from_slice(&id.to_be_bytes());
+        d.extend_from_slice(&(NET | 0x0105).to_be_bytes());
+        d.push(flags);
+        d.extend_from_slice(&cookie);
+        d.extend_from_slice(&[7; 8]);
+        d
+    }
+
+    #[test]
+    fn a_greeting_from_an_address_not_proven_gets_a_cookie_and_nothing_more() {
+        let (b, _) = player();
+        let (x, xa) = socket();
+        let (y, ya) = socket();
+        let lobby = lobby(&b);
+        // Someone else's address as the source: a cookie no larger than
+        // the greeting goes there, nothing is kept or introduced.
+        let hello = greeting(&lobby, 42, ASK, [0; 8]);
+        b.receive(xa, &hello);
+        let got = received(&x);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0][MAGIC.len()], COOKIE);
+        assert!(got[0].len() <= hello.len());
+        {
+            let s = b.state.locked();
+            assert!(s.peers.is_empty() && s.trying.is_empty() && s.given.is_empty() && s.heard.is_empty());
+        }
+        let cookie: [u8; 8] = got[0][MAGIC.len() + 9..MAGIC.len() + 17].try_into().unwrap();
+        // The cookie is the address's: from elsewhere it is not taken.
+        b.receive(ya, &greeting(&lobby, 42, ASK, cookie));
+        assert_eq!(received(&y).len(), 1);
+        assert!(b.state.locked().peers.is_empty());
+        // An answer to a cookie with a wrong one: nothing back (no cookies
+        // going back and forth between two players for ever).
+        b.receive(xa, &greeting(&lobby, 42, ASK | ANSWER, [1; 8]));
+        assert!(received(&x).is_empty());
+        // Greeted again with it: a player, greeted back with its own.
+        b.receive(xa, &greeting(&lobby, 42, ASK | ANSWER, cookie));
+        assert_eq!(b.state.locked().peers.get(&42).and_then(|p| p.addr), Some(xa));
+        let back = received(&x);
+        let hello = back.iter().find(|d| d[MAGIC.len()] == HELLO).unwrap();
+        assert_eq!(hello[MAGIC.len() + 22..MAGIC.len() + 30], [7; 8]);
+    }
+
+    #[test]
+    fn engine_datagrams_come_in_their_sender_s_name() {
+        let now = Instant::now();
+        let mut s = state();
+        let own = NET | 0x0101;
+        let at = |port| SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), port);
+        let (host, relay, far) = (NET | 0x0202, NET | 0x0303, NET | 0x0404);
+        for (id, vip, addr) in [(1, host, Some(at(1))), (2, relay, Some(at(2))), (3, far, None)] {
+            let mut p = Peer::new(vip, [0; 8], now);
+            p.addr = addr;
+            p.seen.extend(addr);
+            p.heard = now;
+            s.peers.insert(id, p);
+        }
+        assert_eq!(s.sender(at(1), host, own, now), Some(true));
+        // Another player in the host's name, or in this player's own, or a
+        // broadcast's: no.
+        assert_eq!(s.sender(at(2), host, own, now), None);
+        assert_eq!(s.sender(at(1), own, own, now), None);
+        assert_eq!(s.sender(at(1), u32::MAX, own, now), None);
+        assert_eq!(s.sender(at(1), NET | 0x02ff, own, now), None);
+        // A player not reached directly, through another.
+        assert_eq!(s.sender(at(2), far, own, now), Some(false));
+        // Not from a player of the lobbies.
+        assert_eq!(s.sender(at(9), far, own, now), None);
+        assert_eq!(s.sender(at(9), NET | 0x0909, own, now), None);
+    }
+
+    #[test]
+    fn cookies_hold_an_epoch_or_two_for_their_address_only() {
+        let now = Instant::now();
+        let c = Cookies::new(now);
+        let addr = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 31329);
+        let cookie = c.of(addr, now);
+        assert!(c.check(addr, &cookie, now));
+        assert!(c.check(addr, &cookie, now + COOKIE_EPOCH));
+        assert!(!c.check(addr, &cookie, now + COOKIE_EPOCH * 2));
+        assert!(!c.check(SocketAddrV4::new(*addr.ip(), 31330), &cookie, now));
+        assert!(!c.check(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 8), 31329), &cookie, now));
+        // Another run's secret.
+        assert!(!Cookies::new(now).check(addr, &cookie, now));
+    }
+
+    #[test]
+    fn two_players_greeting_each_other_first_meet() {
+        let ((a, aa), (b, ba)) = (player(), player());
+        let lobby = lobby(&a);
+        // As two players behind NATs do, both at once.
+        a.hello(ba, ASK, &lobby);
+        b.hello(aa, ASK, &lobby);
+        exchange(&[&a, &b]);
+        for (p, other, at) in [(&a, &b, ba), (&b, &a, aa)] {
+            let s = p.state.locked();
+            assert_eq!(s.peers.get(&other.id).and_then(|q| q.addr), Some(at));
+            assert!(s.given.contains_key(&at));
+        }
+        // From then on their greetings carry the cookies: answered in full.
+        a.hello(ba, ASK, &lobby);
+        for d in received(&b.socket()) {
+            b.receive(aa, &d);
+        }
+        let kinds: Vec<u8> = received(&a.socket()).iter().map(|d| d[MAGIC.len()]).collect();
+        assert_eq!(kinds, [HELLO]);
+    }
+
+    #[test]
+    fn a_player_s_own_greeting_tells_it_its_address() {
+        let (a, aa) = player();
+        a.hello(aa, ASK, &lobby(&a));
+        exchange(&[&a]);
+        let s = a.state.locked();
+        assert!(s.own.contains(&aa) && s.peers.is_empty());
     }
 
     #[test]

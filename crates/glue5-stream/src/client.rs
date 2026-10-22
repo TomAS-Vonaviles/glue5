@@ -31,6 +31,7 @@ use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use glue5_qos::{self as qos, Qos};
 
 use crate::cache::{BLOCK, Cache};
 use crate::catalog::Catalog;
@@ -298,12 +299,15 @@ impl Client {
             boot: Mutex::new(None),
         });
         let before = pending();
+        // In classes of their own, not their creator's (the app's main
+        // thread): the engine's reads wait on the connection's, the saves
+        // and the full download are background work.
         let c = client.clone();
-        let keep = thread::Builder::new().name("stream sync".into()).spawn(move || c.keep()).expect("stream sync thread");
+        let keep = qos::spawn("stream sync", Qos::Utility, move || c.keep()).expect("stream sync thread");
         let c = client.clone();
-        let fill = thread::Builder::new().name("stream fill".into()).spawn(move || c.fill()).expect("stream fill thread");
+        let fill = qos::spawn("stream fill", Qos::Utility, move || c.fill()).expect("stream fill thread");
         let c = client.clone();
-        thread::Builder::new().name("stream".into()).spawn(move || c.run(before, [keep, fill])).expect("stream thread");
+        qos::spawn("stream", Qos::Initiated, move || c.run(before, [keep, fill])).expect("stream thread");
         client
     }
 
@@ -525,28 +529,46 @@ impl Client {
                 return;
             }
         }
-        let mut out = Vec::new();
-        self.plan(id, block, r.boot[k].2, AHEAD, &mut out, usize::MAX);
-        let mut left = FOLLOW / BLOCK;
-        for &(f, a, b) in &r.boot[k + 1..] {
-            if left == 0 {
-                break;
+        self.ask(|out| {
+            self.plan(id, block, r.boot[k].2, AHEAD, out, usize::MAX);
+            let mut left = FOLLOW / BLOCK;
+            for &(f, a, b) in &r.boot[k + 1..] {
+                if left == 0 {
+                    break;
+                }
+                self.plan(f, a, b, AHEAD, out, usize::MAX);
+                left = left.saturating_sub(b - a + 1);
             }
-            self.plan(f, a, b, AHEAD, &mut out, usize::MAX);
-            left = left.saturating_sub(b - a + 1);
-        }
-        self.send(&out);
+        });
     }
 
     /// The engine will read this soon (`ahead`: may read it).
     pub fn hint(&self, id: u32, off: u64, len: u64, ahead: bool) {
+        self.hints(&[(id, off, len, ahead)]);
+    }
+
+    /// [`Self::hint`] for several, asked for in one write.
+    pub fn hints(&self, hints: &[(u32, u64, u64, bool)]) {
         let Some(r) = self.ready.get() else { return };
-        if id as usize >= r.cache.len() || len == 0 || off >= r.cache.size(id) {
+        let wanted: Vec<(u32, u64, u64, u8)> = hints
+            .iter()
+            .filter(|&&(id, off, len, _)| (id as usize) < r.cache.len() && len > 0 && off < r.cache.size(id))
+            .map(|&(id, off, len, ahead)| {
+                let last = (off + len - 1).min(r.cache.size(id) - 1) / BLOCK;
+                (id, off / BLOCK, last, if ahead { AHEAD } else { HINT })
+            })
+            .collect();
+        self.stats.hints.fetch_add(wanted.len() as u64, Ordering::Relaxed);
+        // Those here already need no lock (most, once the copy fills).
+        let missing: Vec<_> = wanted.into_iter().filter(|&(id, first, last, _)| !r.cache.has(id, first, last)).collect();
+        if missing.is_empty() {
             return;
         }
-        let last = (off + len - 1).min(r.cache.size(id) - 1) / BLOCK;
-        self.stats.hints.fetch_add(1, Ordering::Relaxed);
-        self.want(id, off / BLOCK, last, if ahead { AHEAD } else { HINT });
+        self.ask(|out| {
+            for (id, first, last, prio) in missing {
+                self.plan(id, first, last, prio, out, usize::MAX);
+            }
+        });
     }
 
     /// A read that continues the previous one of the file also fetches what
@@ -589,9 +611,29 @@ impl Client {
     /// Makes sure blocks `first..=last` of file `id` are here or on their
     /// way at `prio` at least.
     fn want(&self, id: u32, first: u64, last: u64, prio: u8) {
+        // Here already (read-ahead of what is cached, most hints): no lock.
+        if let Some(r) = self.ready.get()
+            && first < r.cache.blocks(id)
+            && r.cache.has(id, first, last.min(r.cache.blocks(id) - 1))
+        {
+            return;
+        }
+        self.ask(|out| {
+            self.plan(id, first, last, prio, out, usize::MAX);
+        });
+    }
+
+    /// Plans requests and writes them with `sending` held throughout: a
+    /// request is on the wire before any PRIORITY another thread plans for
+    /// it (the server ignores one for a request it has not seen, and the
+    /// raise would be lost for good).
+    fn ask(&self, plan: impl FnOnce(&mut Vec<Header>)) {
+        let _one = self.sending.lock().unwrap();
         let mut out = Vec::new();
-        self.plan(id, first, last, prio, &mut out, usize::MAX);
-        self.send(&out);
+        plan(&mut out);
+        if !out.is_empty() {
+            self.write(&encode(&out));
+        }
     }
 
     /// Adds to `out` the requests (at most `limit` new ones) that bring
@@ -613,7 +655,9 @@ impl Client {
                 return b;
             }
             if r.cache.has_block(id, b) {
-                b += 1;
+                // A word of blocks at a time (a file being filled is scanned
+                // from its start each pass).
+                b = r.cache.first_missing(id, b, last);
                 continue;
             }
             if let Some(req) = inf.covering(id, b) {
@@ -638,17 +682,6 @@ impl Client {
         b
     }
 
-    /// Sends requests (they stay in flight, and are sent again, if the
-    /// connection is down).
-    fn send(&self, msgs: &[Header]) {
-        if msgs.is_empty() {
-            return;
-        }
-        let buf = encode(msgs);
-        let _one = self.sending.lock().unwrap();
-        self.write(&buf);
-    }
-
     /// Writes requests on the connection, if there is one (`sending` held).
     /// One that takes none for [`SILENCE`] (the socket's write timeout: the
     /// server stopped reading) is dead: shut, its session then ends.
@@ -667,9 +700,13 @@ impl Client {
 
     /// Waits for the clients stopped before it (its copy may be one of
     /// theirs), serves until stopped, then finishes: its other threads end,
-    /// and the index is saved one last time.
+    /// the index is saved one last time, and the copy's files and lock are
+    /// closed (with the client, if this thread had the last of it: the app
+    /// lets go of a client it stops) before it says it has finished. Work
+    /// on the folder waits for that: Windows moves no folder with a file
+    /// open in it.
     fn run(self: Arc<Self>, before: Vec<Arc<Done>>, threads: [JoinHandle<()>; 2]) {
-        let _over = Over(self.finished.clone());
+        let over = Over(self.finished.clone());
         for done in before {
             done.wait();
         }
@@ -678,6 +715,8 @@ impl Client {
             let _ = t.join();
         }
         self.flush();
+        drop(self);
+        drop(over);
     }
 
     /// Connects, syncs, serves; again after every lost connection.
@@ -915,14 +954,14 @@ impl Client {
 
     fn prefetch_boot(&self) {
         let Some(r) = self.ready.get() else { return };
-        let mut out = Vec::new();
-        for &(id, first, last) in &r.boot {
-            self.plan(id, first, last, BOOT, &mut out, usize::MAX);
-        }
-        if !out.is_empty() {
-            log::info!("stream: boot set: {} requests", out.len());
-        }
-        self.send(&out);
+        self.ask(|out| {
+            for &(id, first, last) in &r.boot {
+                self.plan(id, first, last, BOOT, out, usize::MAX);
+            }
+            if !out.is_empty() {
+                log::info!("stream: boot set: {} requests", out.len());
+            }
+        });
     }
 
     /// Takes the server's answers until the connection ends.
@@ -1054,24 +1093,25 @@ impl Client {
             let outstanding = self.inflight.lock().unwrap().reqs.values().filter(|q| q.prio == FILL).count();
             let mut budget = FILL_REQUESTS.saturating_sub(outstanding);
             let n = r.cache.len() as u32;
-            let (mut visited, mut incomplete, mut out) = (0, 0, Vec::new());
-            while budget > 0 && visited < n {
-                visited += 1;
-                if !r.cache.complete(cursor) {
-                    incomplete += 1;
-                    let before = out.len();
-                    let stopped = self.plan(cursor, 0, u64::MAX, FILL, &mut out, budget);
-                    budget -= out.len() - before;
-                    if stopped < r.cache.blocks(cursor) {
-                        // The budget ran out in this file: on with it next time.
-                        break;
+            let (mut visited, mut incomplete) = (0, 0);
+            self.ask(|out| {
+                while budget > 0 && visited < n {
+                    visited += 1;
+                    if !r.cache.complete(cursor) {
+                        incomplete += 1;
+                        let before = out.len();
+                        let stopped = self.plan(cursor, 0, u64::MAX, FILL, out, budget);
+                        budget -= out.len() - before;
+                        if stopped < r.cache.blocks(cursor) {
+                            // The budget ran out in this file: on with it next time.
+                            break;
+                        }
                     }
+                    cursor = (cursor + 1) % n.max(1);
                 }
-                cursor = (cursor + 1) % n.max(1);
-            }
-            self.send(&out);
+            });
             if visited == n && incomplete == 0 && outstanding == 0 {
-                match r.cache.finish() {
+                match r.cache.finish(&r.catalog) {
                     Ok(()) => {
                         self.complete.store(true, Ordering::Release);
                         log::info!("stream: the whole game is on this device ({:.1} GB)", r.cache.total() as f64 / 1e9);
@@ -1184,7 +1224,7 @@ pub fn after_stopped(work: impl FnOnce() + Send + 'static) {
         earlier
     };
     let over = Over(done);
-    let spawned = thread::Builder::new().name("stream copy".into()).spawn(move || {
+    let spawned = qos::spawn("stream copy", Qos::Utility, move || {
         let _over = over;
         for done in before {
             done.wait();

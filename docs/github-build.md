@@ -3,8 +3,12 @@
 GitHub builds the app for you, for free. You only need a GitHub account
 and your `game.wasm` file.
 
-> ⚠️ **One rule:** never press **Publish release**. Always press **Save
-> draft**. A draft is private: only you can see it.
+> ⚠️ **Two rules:** never press **Publish release**. Always press **Save
+> draft**. A draft is private: only you can see it. And never put
+> `game.wasm` anywhere else: not in your copy's files (**Add file**, a
+> commit), not behind a download link (not even one in a secret), not in
+> the Actions' artifacts. Those are public, and the build does not read it
+> from there.
 
 ## The first time
 
@@ -23,7 +27,8 @@ In your copy, open **Releases** (on the right side of the main page),
 then **Draft a new release**.
 
 - Title: anything, for example `game`.
-- Drag `game.wasm` into the box at the bottom.
+- Drag `game.wasm` into the box at the bottom. The right one is
+  63,201,802 bytes. Zipped is fine too, named `game.wasm.zip`.
 - Wait until it has finished uploading.
 - Press **Save draft**. ⚠️ Not **Publish release**.
 
@@ -41,6 +46,9 @@ then **Draft a new release**.
 
 If something is missing or wrong, the build stops and the red ❌ tells
 you what to do: open it and read the message.
+
+If it is cancelled because the job was "not acquired by a runner",
+GitHub had no free machine: run it again later.
 
 ## Install the app
 
@@ -61,8 +69,8 @@ you what to do: open it and read the message.
   Privacy & Security** and press **Open Anyway**.
 - **Linux** (`Glue5-linux-….AppImage`): make it executable and run it.
 
-Then put the game's files on the device: see the
-[README](../README.md#platforms).
+Then put the game's files on the device: see
+[Getting started](getting-started.md#3-install-it-and-add-the-files).
 
 ## Get a new version
 

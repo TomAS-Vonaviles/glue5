@@ -20,9 +20,11 @@ mod share;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use glue5_game::{Env, orig};
 
+use crate::Locked;
 use crate::cloud::{NET_STATUS_FAILED, NET_STATUS_SUCCEEDED, finish};
 use crate::memory::Mem;
 
@@ -108,15 +110,17 @@ struct Job {
     kind: Kind,
     /// The game's: one file per language, `<path><language>_00.ugc`.
     path: PathBuf,
-    /// The shared file's fingerprint (share.rs) and its size.
+    /// The shared file's fingerprint (share.rs), its size, and when it was
+    /// written.
     hash: [u8; 8],
     size: u32,
+    modified: SystemTime,
 }
 
 static LIBRARY: Mutex<Option<Vec<Job>>> = Mutex::new(None);
 
 fn library() -> MutexGuard<'static, Option<Vec<Job>>> {
-    let mut library = LIBRARY.lock().unwrap();
+    let mut library = LIBRARY.locked();
     if library.is_none() {
         let rt = crate::rt();
         let mut jobs = game_jobs(&crate::layout::data_dir(&rt.config.game_dir).join("common/data/ugc"));
@@ -202,8 +206,15 @@ fn fingerprint(data: &[u8]) -> [u8; 8] {
 }
 
 fn read_job(path: &Path, id: &str, kind: Kind, creator: &str) -> Option<Job> {
+    // The time first: a file written meanwhile reads as changed (share.rs).
+    let modified = modified(path);
     let data = std::fs::read(path).map_err(|e| log::warn!("jobs: {}: {e}", path.display())).ok()?;
-    parse_job(&data, id, kind, creator, path)
+    Some(Job { modified, ..parse_job(&data, id, kind, creator, path)? })
+}
+
+/// When a file was last written.
+fn modified(path: &Path) -> SystemTime {
+    std::fs::metadata(path).and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH)
 }
 
 fn parse_job(data: &[u8], id: &str, kind: Kind, creator: &str, path: &Path) -> Option<Job> {
@@ -234,6 +245,7 @@ fn parse_job(data: &[u8], id: &str, kind: Kind, creator: &str, path: &Path) -> O
         path: path.to_owned(),
         hash: fingerprint(data),
         size: data.len() as u32,
+        modified: UNIX_EPOCH,
     })
 }
 
@@ -418,7 +430,7 @@ pub(crate) unsafe extern "C" fn ugc_get_file(env: *mut Env, request: u64) -> u32
     let m = unsafe { Mem::of(env) };
     let id = m.str(request + REQUEST_CONTENT_ID);
     let status = request + REQUEST_STATUS;
-    let job = jobs().into_iter().find(|j| j.id == id);
+    let job = library().as_ref().unwrap().iter().find(|j| j.id == id).cloned();
     let data = match job {
         Some(job) if m.u32(request + REQUEST_FILE) == MISSION_FILE => {
             let path = job.path(m.u32(request + REQUEST_LANGUAGE));
@@ -459,13 +471,14 @@ fn mission_file(m: Mem, files: u64, count: u32) -> Option<Vec<u8>> {
 fn save(id: &str, data: &[u8]) -> bool {
     let dir = own_dir();
     let path = dir.join(format!("{id}.json"));
-    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, data)) {
+    if let Err(e) = crate::write_file(&path, data) {
         log::error!("jobs: saving {}: {e}", path.display());
         return false;
     }
     let creator = crate::rt().config.online.as_ref().map_or_else(String::new, |o| o.name.clone());
     match parse_job(data, id, Kind::Own, &creator, &path) {
         Some(job) => {
+            let job = Job { modified: modified(&path), ..job };
             log::info!("jobs: saved \"{}\" as {}", job.name, path.display());
             add(job);
             true
@@ -499,7 +512,15 @@ pub(crate) unsafe extern "C" fn ugc_create(
     let id = content_id(&format!("{title} {} {:?}", gamer_tag(), std::time::SystemTime::now()));
     let saved = mission_file(m, files, count).is_some_and(|file| save(&id, &file));
     let created = manager + MANAGER_CREATED;
-    m.bytes_mut(created, MD_SIZE as usize).fill(0);
+    // Its fields, around the two buffers: emptied as theirs (zeroed, they
+    // would lose their allocator and grow step, the engine's next append
+    // overflowing).
+    m.bytes_mut(created, MD_DESCRIPTION as usize).fill(0);
+    m.bytes_mut(created + MD_LANGUAGE, (MD_SIZE - MD_LANGUAGE) as usize).fill(0);
+    unsafe {
+        orig::grow_buffer_clear(env, created + MD_DESCRIPTION);
+        orig::grow_buffer_clear(env, created + MD_DATA);
+    }
     m.set_u32(created + MD_TYPE, CONTENT_MISSION);
     m.write_str(created + MD_CONTENT_ID, &id, ID_CAP);
     m.write_str(created + MD_NAME, &title, NAME_CAP);

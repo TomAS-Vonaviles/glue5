@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths::{MOBILE, TV};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// The game directory, once found or chosen.
@@ -46,6 +46,9 @@ pub struct Settings {
     /// macOS and iOS 26): twice the frames shown, half a frame more of
     /// latency.
     pub frame_generation: bool,
+    /// The GPU driver the user added that the renderer opens at launch
+    /// (Android, Adreno GPUs: drivers.rs); none: the phone's own.
+    pub gpu_driver: Option<String>,
     /// The performance overlay over the game, and how the application's
     /// own shows.
     pub overlay: PerfOverlay,
@@ -76,6 +79,9 @@ pub struct Settings {
     pub studio: bool,
     /// Other devices on the network may open the Studio (with its code).
     pub studio_lan: bool,
+    /// The Studio's pairing code: kept, so that a browser paired once stays
+    /// paired when the game starts again (the Mods page makes a new one).
+    pub studio_code: String,
     /// Settings saved before the render scale: the back buffer's height.
     #[serde(skip_serializing)]
     render_height: Option<u32>,
@@ -217,6 +223,7 @@ impl Default for Settings {
             upscaler: Upscaling::MetalFx,
             sharpness: 0.5,
             frame_generation: false,
+            gpu_driver: None,
             overlay: PerfOverlay::Off,
             overlay_detail: OverlayDetail::Standard,
             overlay_corner: Corner::TopLeft,
@@ -234,6 +241,7 @@ impl Default for Settings {
             studio: true,
             // A phone's own browser is no place to write mods.
             studio_lan: crate::paths::MOBILE,
+            studio_code: String::new(),
             render_height: None,
             metalfx: None,
             metal_hud: None,
@@ -257,9 +265,15 @@ impl Settings {
     }
 
     pub fn load(user_dir: &Path) -> Settings {
-        let mut settings = match std::fs::read(Self::file(user_dir)) {
+        let file = Self::file(user_dir);
+        let mut settings = match std::fs::read(&file) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                log::warn!("ignoring unreadable settings: {e}");
+                // Kept aside (the defaults are saved over it soon), not lost.
+                let aside = file.with_extension("json.bad");
+                match std::fs::rename(&file, &aside) {
+                    Ok(()) => log::warn!("settings unreadable ({e}): kept as {}, the defaults instead", aside.display()),
+                    Err(r) => log::warn!("settings unreadable ({e}), not kept aside ({r}): the defaults instead"),
+                }
                 Settings::default()
             }),
             Err(_) => Settings::default(),
@@ -278,7 +292,11 @@ impl Settings {
 
     pub fn save(&self, user_dir: &Path) {
         let json = serde_json::to_vec_pretty(self).expect("settings serialise");
-        if let Err(e) = std::fs::write(Self::file(user_dir), json) {
+        // Through a copy: a write cut short (disk full, the app killed)
+        // leaves the old file, not one that loads as the defaults.
+        let file = Self::file(user_dir);
+        let tmp = file.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &file)) {
             log::warn!("cannot save settings: {e}");
         }
     }
@@ -344,6 +362,20 @@ mod tests {
         assert_eq!(Settings::load(&dir).overlay, PerfOverlay::MetalHud);
         std::fs::write(dir.join("glue5.json"), r#"{"metal_hud": false}"#).unwrap();
         assert_eq!(Settings::load(&dir).overlay, PerfOverlay::Off);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Settings that cannot be read are kept aside, not saved over.
+    #[test]
+    fn unreadable_settings_kept_aside() {
+        let dir = std::env::temp_dir().join(format!("glue5-settings-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("glue5.json"), b"{\"online\": tru").unwrap();
+        let s = Settings::load(&dir);
+        assert_eq!(s.online, Settings::default().online);
+        s.save(&dir);
+        assert_eq!(std::fs::read(dir.join("glue5.json.bad")).unwrap(), b"{\"online\": tru");
+        assert!(serde_json::from_slice::<Settings>(&std::fs::read(dir.join("glue5.json")).unwrap()).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
